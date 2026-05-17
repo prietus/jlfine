@@ -1,0 +1,19 @@
+[package]
+name = "poc-jellyfin-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poc-jellyfin-api"
+path = "src/main.rs"
+
+[dependencies]
+jellyfin-api.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow.workspace = true
+url.workspace = true
+reqwest.workspace = true

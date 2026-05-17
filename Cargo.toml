@@ -10,6 +10,7 @@ members = [
     "apps/jelly",
     "apps/poc-libmpv",
     "apps/poc-bitperfect-mac",
+    "apps/poc-jellyfin-api",
 ]
 
 [workspace.package]
