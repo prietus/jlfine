@@ -9,6 +9,7 @@ members = [
     "crates/jelly-ui",
     "apps/jelly",
     "apps/poc-libmpv",
+    "apps/poc-bitperfect-mac",
 ]
 
 [workspace.package]

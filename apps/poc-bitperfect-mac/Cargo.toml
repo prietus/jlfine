@@ -1,0 +1,17 @@
+[package]
+name = "poc-bitperfect-mac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poc-bitperfect-mac"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-sys = "0.2"
+core-foundation = "0.10"
+anyhow.workspace = true
