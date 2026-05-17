@@ -19,6 +19,7 @@ export struct Item {
     subtitle: string,
     image: image,
     has-image: bool,
+    item-type: string,
 }
 
 export enum Screen { login, library }
@@ -266,9 +267,11 @@ component LibraryScreen inherits Rectangle {
     in property <string> view-title;
     in property <string> view-subtitle;
     in property <string> view-collection-type;
+    in property <bool> can-go-back: false;
     callback select-view(int, string, string);
     callback sign-out();
-    callback item-clicked(string, string);
+    callback activate-item(string, string);
+    callback back-clicked();
 
     background: Theme.bg-base;
 
@@ -342,20 +345,45 @@ component LibraryScreen inherits Rectangle {
                 Rectangle {
                     height: 88px;
                     background: Theme.bg-base;
+                    // Back affordance only appears mid-stack. Title shifts
+                    // right to make room without re-laying out anything.
+                    back-ta := TouchArea {
+                        x: 24px;
+                        y: 24px;
+                        width: 36px;
+                        height: 36px;
+                        visible: root.can-go-back;
+                        mouse-cursor: pointer;
+                        clicked => { root.back-clicked(); }
+                        Rectangle {
+                            background: parent.has-hover ? #ffffff14 : transparent;
+                            border-radius: 18px;
+                            animate background { duration: 120ms; }
+                            Text {
+                                text: "←";
+                                color: Theme.text-primary;
+                                font-size: 18px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
                     Text {
-                        x: 32px;
+                        x: root.can-go-back ? 72px : 32px;
                         y: 28px;
                         text: root.view-title;
                         color: Theme.text-primary;
                         font-size: 26px;
                         font-weight: 600;
+                        animate x { duration: 180ms; easing: ease-out; }
                     }
                     Text {
-                        x: 32px;
+                        x: root.can-go-back ? 72px : 32px;
                         y: 60px;
                         text: root.view-subtitle;
                         color: Theme.text-muted;
                         font-size: 13px;
+                        animate x { duration: 180ms; easing: ease-out; }
                     }
                     Text {
                         x: parent.width - self.width - 32px;
@@ -381,7 +409,7 @@ component LibraryScreen inherits Rectangle {
                         y: 16px + floor(i / max(1, parent.cols)) * (250px + 20px);
                         data: it;
                         clicked => {
-                            root.item-clicked(it.id, root.view-collection-type);
+                            root.activate-item(it.id, it.item-type);
                         }
                     }
                 }
@@ -412,11 +440,13 @@ export component MainWindow inherits Window {
     in property <string> view-title: "";
     in property <string> view-subtitle: "";
     in property <string> view-collection-type: "";
+    in property <bool> can-go-back: false;
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
     callback view-selected(string, string);
-    callback play-item(string, string);
+    callback activate-item(string, string);
+    callback back-clicked();
 
     // Two screens; cross-fade between them with opacity.
     login := LoginScreen {
@@ -453,11 +483,13 @@ export component MainWindow inherits Window {
         view-title: root.view-title;
         view-subtitle: root.view-subtitle;
         view-collection-type: root.view-collection-type;
+        can-go-back: root.can-go-back;
         select-view(i, id, ct) => {
             root.selected-view = i;
             root.view-selected(id, ct);
         }
         sign-out => { root.sign-out-clicked(); }
-        item-clicked(id, ct) => { root.play-item(id, ct); }
+        activate-item(id, ct) => { root.activate-item(id, ct); }
+        back-clicked => { root.back-clicked(); }
     }
 }

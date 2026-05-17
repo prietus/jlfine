@@ -7,6 +7,12 @@
 //! via an mpsc channel; updates flow backend → UI via
 //! `slint::invoke_from_event_loop`, the only thread-safe way to mutate
 //! window state in Slint.
+//!
+//! Browsing keeps a small nav stack inside `run_authed`. The bottom
+//! entry is always the selected library view; pushing happens when
+//! the user activates a "container" item (album → tracks, series →
+//! seasons → episodes, playlist → items). Going back pops one level
+//! and refetches that level's children.
 
 #![allow(clippy::needless_return)]
 
@@ -14,7 +20,7 @@ use anyhow::{Context, Result};
 use jelly_storage::Storage;
 use jellyfin_api::{
     BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
-    SortOrder, image_url, video_stream_url,
+    SortOrder, image_url, ticks_to_seconds, video_stream_url,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
@@ -28,7 +34,7 @@ slint::include_modules!();
 
 const ITEM_LIMIT: u32 = 200;
 const IMAGE_PARALLELISM: usize = 8;
-const IMAGE_FILL_HEIGHT: u32 = 360; // 2x the card height for retina
+const IMAGE_FILL_HEIGHT: u32 = 360;
 
 pub fn run() -> Result<()> {
     let storage = Arc::new(Storage::new().context("init storage")?);
@@ -36,7 +42,6 @@ pub fn run() -> Result<()> {
 
     let window = MainWindow::new()?;
     let weak = window.as_weak();
-
     let (cmd_tx, cmd_rx) = unbounded_channel::<BackendCmd>();
 
     {
@@ -76,13 +81,19 @@ pub fn run() -> Result<()> {
             });
         }
     });
-    window.on_play_item({
+    window.on_activate_item({
         let cmd_tx = cmd_tx.clone();
-        move |item_id, collection_type| {
-            let _ = cmd_tx.send(BackendCmd::PlayItem {
+        move |item_id, item_type| {
+            let _ = cmd_tx.send(BackendCmd::ActivateItem {
                 item_id: item_id.to_string(),
-                collection_type: collection_type.to_string(),
+                item_type: item_type.to_string(),
             });
+        }
+    });
+    window.on_back_clicked({
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(BackendCmd::GoBack);
         }
     });
 
@@ -90,7 +101,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- backend
+// ---------------------------------------------------------------- commands
 
 enum BackendCmd {
     SignIn {
@@ -103,11 +114,115 @@ enum BackendCmd {
         view_id: String,
         collection_type: String,
     },
-    PlayItem {
+    ActivateItem {
         item_id: String,
-        collection_type: String,
+        item_type: String,
     },
+    GoBack,
 }
+
+// ---------------------------------------------------------------- nav model
+
+#[derive(Clone)]
+struct NavEntry {
+    /// `parentId` to pass in the items query for this level.
+    parent_id: String,
+    /// Header title for this level.
+    title: String,
+    /// Header subtitle for this level (filled in after fetching).
+    subtitle: String,
+    children: ChildrenType,
+}
+
+/// Determines the filter / sort applied when fetching children of a
+/// given nav entry. Library roots are filtered by their collection
+/// type; deeper levels just enumerate the right item kind.
+#[derive(Clone)]
+enum ChildrenType {
+    LibraryRoot { collection_type: String },
+    Tracks,
+    Seasons,
+    Episodes,
+    PlaylistItems,
+}
+
+impl ChildrenType {
+    fn query(&self, parent_id: &str) -> ItemsQuery {
+        let mut q = ItemsQuery {
+            parent_id: Some(parent_id.to_string()),
+            limit: Some(ITEM_LIMIT),
+            recursive: Some(true),
+            fields: vec![
+                "PrimaryImageAspectRatio".into(),
+                "Genres".into(),
+                "ChildCount".into(),
+            ],
+            sort_order: Some(SortOrder::Ascending),
+            ..Default::default()
+        };
+        match self {
+            ChildrenType::LibraryRoot { collection_type } => match collection_type.as_str() {
+                "music" => {
+                    q.include_item_types = vec![ItemType::MusicAlbum];
+                    q.sort_by = vec!["SortName".into()];
+                }
+                "movies" => {
+                    q.include_item_types = vec![ItemType::Movie];
+                    q.sort_by = vec!["SortName".into(), "ProductionYear".into()];
+                }
+                "tvshows" => {
+                    q.include_item_types = vec![ItemType::Series];
+                    q.sort_by = vec!["SortName".into()];
+                }
+                "playlists" => {
+                    q.include_item_types = vec![ItemType::Playlist];
+                    q.sort_by = vec!["SortName".into()];
+                }
+                _ => {
+                    q.sort_by = vec!["SortName".into()];
+                }
+            },
+            ChildrenType::Tracks => {
+                q.include_item_types = vec![ItemType::Audio];
+                q.sort_by = vec!["ParentIndexNumber".into(), "IndexNumber".into()];
+                q.recursive = Some(false); // direct children only
+            }
+            ChildrenType::Seasons => {
+                q.include_item_types = vec![ItemType::Season];
+                q.sort_by = vec!["IndexNumber".into()];
+                q.recursive = Some(false);
+            }
+            ChildrenType::Episodes => {
+                q.include_item_types = vec![ItemType::Episode];
+                q.sort_by = vec!["IndexNumber".into()];
+                q.recursive = Some(false);
+            }
+            ChildrenType::PlaylistItems => {
+                q.sort_by = vec!["SortName".into()];
+                q.recursive = Some(false);
+            }
+        }
+        q
+    }
+
+    /// Collection type shown in the Slint window for header context.
+    fn collection_label(&self) -> &'static str {
+        match self {
+            ChildrenType::LibraryRoot { collection_type } => match collection_type.as_str() {
+                "music" => "music",
+                "movies" => "movies",
+                "tvshows" => "tvshows",
+                "playlists" => "playlists",
+                _ => "",
+            },
+            ChildrenType::Tracks => "music",
+            ChildrenType::Seasons | ChildrenType::Episodes => "tvshows",
+            ChildrenType::PlaylistItems => "playlists",
+        }
+    }
+}
+
+// ---------------------------------------------------------------- backend loop
 
 async fn backend_loop(
     weak: slint::Weak<MainWindow>,
@@ -161,7 +276,10 @@ async fn backend_loop(
                     Err(e) => set_error(&weak, &format!("{e:#}")),
                 }
             }
-            BackendCmd::SignOut | BackendCmd::SelectView { .. } | BackendCmd::PlayItem { .. } => {}
+            BackendCmd::SignOut
+            | BackendCmd::SelectView { .. }
+            | BackendCmd::ActivateItem { .. }
+            | BackendCmd::GoBack => {}
         }
     }
 }
@@ -216,11 +334,15 @@ impl AuthedState {
 async fn run_authed(
     state: AuthedState,
     storage: Arc<Storage>,
-    initial_view: Option<jellyfin_api::BaseItemDto>,
+    initial_view: Option<BaseItemDto>,
     cmd_rx: &mut UnboundedReceiver<BackendCmd>,
 ) {
+    let mut nav: Vec<NavEntry> = Vec::new();
+    let mut current_items: Vec<BaseItemDto> = Vec::new();
+
     if let Some(v) = initial_view {
-        select_view(&state, &v.id, v.collection_type.as_deref().unwrap_or(""));
+        nav.push(library_root_entry(&v));
+        fetch_and_render(&state, &nav, &mut current_items).await;
     }
 
     while let Some(cmd) = cmd_rx.recv().await {
@@ -229,13 +351,23 @@ async fn run_authed(
                 view_id,
                 collection_type,
             } => {
-                select_view(&state, &view_id, &collection_type);
+                nav.clear();
+                nav.push(NavEntry {
+                    parent_id: view_id,
+                    title: view_title(&collection_type),
+                    subtitle: String::new(),
+                    children: ChildrenType::LibraryRoot { collection_type },
+                });
+                fetch_and_render(&state, &nav, &mut current_items).await;
             }
-            BackendCmd::PlayItem {
-                item_id,
-                collection_type,
-            } => {
-                play_item(&state, &item_id, &collection_type);
+            BackendCmd::ActivateItem { item_id, item_type } => {
+                activate(&state, &mut nav, &mut current_items, &item_id, &item_type).await;
+            }
+            BackendCmd::GoBack => {
+                if nav.len() > 1 {
+                    nav.pop();
+                    fetch_and_render(&state, &nav, &mut current_items).await;
+                }
             }
             BackendCmd::SignOut => {
                 info!("signing out");
@@ -250,142 +382,209 @@ async fn run_authed(
     }
 }
 
-fn play_item(state: &AuthedState, item_id: &str, collection_type: &str) {
-    match collection_type {
-        "movies" => {
+fn library_root_entry(view: &BaseItemDto) -> NavEntry {
+    let ct = view.collection_type.clone().unwrap_or_default();
+    NavEntry {
+        parent_id: view.id.clone(),
+        title: view_title(&ct),
+        subtitle: String::new(),
+        children: ChildrenType::LibraryRoot {
+            collection_type: ct,
+        },
+    }
+}
+
+/// Click handler for an item. Leaves cause playback; containers push
+/// a new nav level and refetch.
+async fn activate(
+    state: &AuthedState,
+    nav: &mut Vec<NavEntry>,
+    current_items: &mut Vec<BaseItemDto>,
+    item_id: &str,
+    item_type: &str,
+) {
+    match item_type {
+        "Movie" | "Episode" | "Video" => {
             let Some(token) = state.client.token() else {
                 warn!("no token; cannot play");
                 return;
             };
             let url = video_stream_url(state.client.base_url(), item_id, token);
-            info!(%url, "play movie");
+            info!(%url, kind = item_type, "play video");
             video_engine::play(url.to_string());
         }
+        "Audio" => {
+            info!(item = item_id, "audio playback not wired yet");
+        }
+        "MusicAlbum" | "Series" | "Season" | "Playlist" => {
+            let Some(item) = current_items.iter().find(|i| i.id == item_id).cloned() else {
+                warn!(item_id, "activate target not in current_items");
+                return;
+            };
+            let children = match item_type {
+                "MusicAlbum" => ChildrenType::Tracks,
+                "Series" => ChildrenType::Seasons,
+                "Season" => ChildrenType::Episodes,
+                "Playlist" => ChildrenType::PlaylistItems,
+                _ => unreachable!(),
+            };
+            nav.push(NavEntry {
+                parent_id: item.id.clone(),
+                title: item.name.clone().unwrap_or_default(),
+                subtitle: detail_subtitle(&item, item_type),
+                children,
+            });
+            fetch_and_render(state, nav, current_items).await;
+        }
         other => {
-            info!(
-                item = item_id,
-                ct = other,
-                "playback for this type not wired yet"
-            );
+            info!(item = item_id, kind = other, "activation not supported yet");
         }
     }
 }
 
-/// Increment the epoch, fetch items, then fire-and-forget the image
-/// downloads. Returns immediately; each image push checks the current
-/// epoch and skips itself if the user has navigated away.
-fn select_view(state: &AuthedState, view_id: &str, collection_type: &str) {
-    let epoch = state.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-    debug!(view = view_id, ct = collection_type, epoch, "select view");
-
-    let weak = state.weak.clone();
-    let client = state.client.clone();
-    let user_id = state.user_id.clone();
-    let view_id = view_id.to_string();
-    let collection_type = collection_type.to_string();
-    let epoch_for_task = state.epoch.clone();
-    let image_http = state.image_http.clone();
-    let image_sem = state.image_sem.clone();
-
-    set_loading(&weak, true);
-    set_view_title(&weak, view_title(&collection_type, ""), "Loading…".into());
-    set_view_collection_type(&weak, collection_type.clone());
-    set_items(&weak, vec![]);
-
-    tokio::spawn(async move {
-        let query = items_query_for(&view_id, &collection_type);
-        let resp = match client.items(&user_id, &query).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(?e, "items fetch failed");
-                if epoch_for_task.load(Ordering::SeqCst) == epoch {
-                    set_loading(&weak, false);
-                    set_view_title(&weak, "Error".into(), format!("{e:#}"));
-                }
-                return;
-            }
-        };
-
-        if epoch_for_task.load(Ordering::SeqCst) != epoch {
-            return;
-        }
-
-        let total = resp.total_record_count.unwrap_or(resp.items.len() as i64);
-        let count_label = if total as usize > resp.items.len() {
-            format!("{} of {} items", resp.items.len(), total)
-        } else {
-            format!("{} items", resp.items.len())
-        };
-
-        let items_data = resp
-            .items
-            .iter()
-            .map(|i| build_initial_item_data(i, &collection_type))
-            .collect::<Vec<_>>();
-
-        set_view_title(&weak, view_title(&collection_type, ""), count_label);
-        set_items(&weak, items_data);
-        set_loading(&weak, false);
-
-        // Snapshot of (index, item_id, image_tag) for items that have
-        // a Primary image. The image URL is built locally; tag goes in
-        // the query so server caches don't serve stale art.
-        let base = client.base_url().clone();
-        let to_load: Vec<(usize, String, String)> = resp
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, item)| {
-                item.image_tags
-                    .as_ref()
-                    .and_then(|t| t.get("Primary"))
-                    .cloned()
-                    .map(|tag| (i, item.id.clone(), tag))
-            })
-            .collect();
-
-        for (i, item_id, tag) in to_load {
-            let weak = weak.clone();
-            let http = image_http.clone();
-            let sem = image_sem.clone();
-            let epoch_ref = epoch_for_task.clone();
-            let base = base.clone();
-            tokio::spawn(async move {
-                let _permit = match sem.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                if epoch_ref.load(Ordering::SeqCst) != epoch {
-                    return;
-                }
-                let url = image_url(
-                    &base,
-                    &item_id,
-                    ApiImageType::Primary,
-                    &ImageOptions {
-                        tag: Some(tag),
-                        fill_height: Some(IMAGE_FILL_HEIGHT),
-                        quality: Some(90),
-                        ..Default::default()
-                    },
-                );
-                match fetch_image(&http, &url).await {
-                    Ok((rgba, w, h)) => {
-                        if epoch_ref.load(Ordering::SeqCst) == epoch {
-                            push_item_image(&weak, epoch_ref.clone(), epoch, i, rgba, w, h);
-                        }
-                    }
-                    Err(e) => debug!(?e, %url, "image fetch failed"),
-                }
-            });
-        }
-    });
+fn detail_subtitle(item: &BaseItemDto, item_type: &str) -> String {
+    match item_type {
+        "MusicAlbum" => item
+            .album_artist
+            .clone()
+            .or_else(|| item.production_year.map(|y| y.to_string()))
+            .unwrap_or_default(),
+        "Series" => item
+            .production_year
+            .map(|y| y.to_string())
+            .unwrap_or_default(),
+        "Season" => item
+            .child_count
+            .map(|c| format!("{c} episodes"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
-/// Decode an image off the UI thread. Returns raw RGBA bytes plus
-/// dimensions so the caller can ship them across the Slint event-loop
-/// boundary (`slint::Image` is not `Send`, so we build it on the UI
-/// thread instead).
+/// Increment the epoch (cancels image loads from the previous level),
+/// push placeholders, fetch this level's items, render them, then kick
+/// off concurrent image downloads. Returns after the fetch finishes;
+/// images stream in afterwards via background tasks.
+async fn fetch_and_render(
+    state: &AuthedState,
+    nav: &[NavEntry],
+    current_items: &mut Vec<BaseItemDto>,
+) {
+    let top = nav.last().expect("nav non-empty");
+    let epoch = state.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    debug!(epoch, title = %top.title, "fetch level");
+
+    set_loading(&state.weak, true);
+    set_view_meta(
+        &state.weak,
+        top.title.clone(),
+        if top.subtitle.is_empty() {
+            "Loading…".into()
+        } else {
+            top.subtitle.clone()
+        },
+        top.children.collection_label().into(),
+    );
+    set_can_go_back(&state.weak, nav.len() > 1);
+    set_items(&state.weak, vec![]);
+
+    let resp = match state
+        .client
+        .items(&state.user_id, &top.children.query(&top.parent_id))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(?e, "items fetch failed");
+            if state.epoch.load(Ordering::SeqCst) == epoch {
+                set_loading(&state.weak, false);
+                set_view_meta(&state.weak, "Error".into(), format!("{e:#}"), String::new());
+            }
+            return;
+        }
+    };
+
+    if state.epoch.load(Ordering::SeqCst) != epoch {
+        return;
+    }
+
+    let total = resp.total_record_count.unwrap_or(resp.items.len() as i64);
+    let count_label = if total as usize > resp.items.len() {
+        format!("{} of {} items", resp.items.len(), total)
+    } else {
+        format!("{} items", resp.items.len())
+    };
+    let header_subtitle = if top.subtitle.is_empty() {
+        count_label
+    } else {
+        format!("{} · {}", top.subtitle, count_label)
+    };
+
+    let items_data: Vec<ItemData> = resp.items.iter().map(build_initial_item_data).collect();
+
+    set_view_meta(
+        &state.weak,
+        top.title.clone(),
+        header_subtitle,
+        top.children.collection_label().into(),
+    );
+    set_items(&state.weak, items_data);
+    set_loading(&state.weak, false);
+
+    *current_items = resp.items.clone();
+
+    // Image downloads.
+    let base = state.client.base_url().clone();
+    let to_load: Vec<(usize, String, String)> = resp
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            item.image_tags
+                .as_ref()
+                .and_then(|t| t.get("Primary"))
+                .cloned()
+                .map(|tag| (i, item.id.clone(), tag))
+        })
+        .collect();
+
+    for (i, item_id, tag) in to_load {
+        let weak = state.weak.clone();
+        let http = state.image_http.clone();
+        let sem = state.image_sem.clone();
+        let epoch_ref = state.epoch.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            if epoch_ref.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            let url = image_url(
+                &base,
+                &item_id,
+                ApiImageType::Primary,
+                &ImageOptions {
+                    tag: Some(tag),
+                    fill_height: Some(IMAGE_FILL_HEIGHT),
+                    quality: Some(90),
+                    ..Default::default()
+                },
+            );
+            match fetch_image(&http, &url).await {
+                Ok((rgba, w, h)) => {
+                    if epoch_ref.load(Ordering::SeqCst) == epoch {
+                        push_item_image(&weak, epoch_ref.clone(), epoch, i, rgba, w, h);
+                    }
+                }
+                Err(e) => debug!(?e, %url, "image fetch failed"),
+            }
+        });
+    }
+}
+
 async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32, u32)> {
     let bytes = http
         .get(url.as_str())
@@ -408,51 +607,44 @@ async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32,
 
 // ---------------------------------------------------------------- mapping
 
-fn items_query_for(view_id: &str, collection_type: &str) -> ItemsQuery {
-    let (types, sort) = match collection_type {
-        "music" => (vec![ItemType::MusicAlbum], vec!["SortName".into()]),
-        "movies" => (
-            vec![ItemType::Movie],
-            vec!["SortName".into(), "ProductionYear".into()],
-        ),
-        "tvshows" => (vec![ItemType::Series], vec!["SortName".into()]),
-        "playlists" => (vec![ItemType::Playlist], vec!["SortName".into()]),
-        _ => (vec![], vec!["SortName".into()]),
-    };
-    ItemsQuery {
-        parent_id: Some(view_id.to_string()),
-        include_item_types: types,
-        sort_by: sort,
-        sort_order: Some(SortOrder::Ascending),
-        limit: Some(ITEM_LIMIT),
-        recursive: Some(true),
-        fields: vec!["PrimaryImageAspectRatio".into(), "Genres".into()],
-        ..Default::default()
-    }
-}
-
-/// Plain-Rust mirror of the Slint `Item` struct used for crossing the
-/// event-loop boundary. The Slint type contains a non-`Send`
-/// `slint::Image`, so we build it inside the UI-thread closure.
 #[derive(Clone)]
 struct ItemData {
     id: String,
     title: String,
     subtitle: String,
+    item_type: String,
 }
 
-fn build_initial_item_data(item: &BaseItemDto, collection_type: &str) -> ItemData {
+/// Build the UI-side row for a Jellyfin item. Subtitle and visible
+/// type both come from the item's own `Type` field, so this works
+/// regardless of which nav level we're rendering.
+fn build_initial_item_data(item: &BaseItemDto) -> ItemData {
+    let item_type = item_type_str(&item.item_type);
     let title = item.name.clone().unwrap_or_default();
-    let subtitle = match collection_type {
-        "music" => item
+    let subtitle = match item_type.as_str() {
+        "MusicAlbum" => item
             .album_artist
             .clone()
             .or_else(|| item.artists.as_ref().and_then(|a| a.first().cloned()))
             .or_else(|| item.production_year.map(|y| y.to_string()))
             .unwrap_or_default(),
-        "movies" | "tvshows" => item
+        "Audio" => item.run_time_ticks.map(format_duration).unwrap_or_default(),
+        "Movie" | "Series" => item
             .production_year
             .map(|y| y.to_string())
+            .unwrap_or_default(),
+        "Season" => item
+            .child_count
+            .map(|c| format!("{c} episodes"))
+            .unwrap_or_default(),
+        "Episode" => match (item.parent_index_number, item.index_number) {
+            (Some(s), Some(e)) => format!("S{s:02}E{e:02}"),
+            (None, Some(e)) => format!("E{e:02}"),
+            _ => String::new(),
+        },
+        "Playlist" => item
+            .child_count
+            .map(|c| format!("{c} items"))
             .unwrap_or_default(),
         _ => String::new(),
     };
@@ -460,22 +652,48 @@ fn build_initial_item_data(item: &BaseItemDto, collection_type: &str) -> ItemDat
         id: item.id.clone(),
         title,
         subtitle,
+        item_type,
     }
 }
 
-fn view_title(collection_type: &str, fallback: &str) -> String {
+fn item_type_str(t: &Option<ItemType>) -> String {
+    match t {
+        Some(ItemType::Movie) => "Movie".into(),
+        Some(ItemType::Series) => "Series".into(),
+        Some(ItemType::Season) => "Season".into(),
+        Some(ItemType::Episode) => "Episode".into(),
+        Some(ItemType::MusicAlbum) => "MusicAlbum".into(),
+        Some(ItemType::MusicArtist) => "MusicArtist".into(),
+        Some(ItemType::Audio) => "Audio".into(),
+        Some(ItemType::Folder) => "Folder".into(),
+        Some(ItemType::CollectionFolder) => "CollectionFolder".into(),
+        Some(ItemType::BoxSet) => "BoxSet".into(),
+        Some(ItemType::Playlist) => "Playlist".into(),
+        Some(ItemType::Video) => "Video".into(),
+        Some(ItemType::Other(s)) => s.clone(),
+        None => String::new(),
+    }
+}
+
+fn view_title(collection_type: &str) -> String {
     match collection_type {
         "music" => "Music".into(),
         "movies" => "Movies".into(),
         "tvshows" => "TV Shows".into(),
         "playlists" => "Playlists".into(),
-        _ => {
-            if fallback.is_empty() {
-                "Library".into()
-            } else {
-                fallback.into()
-            }
-        }
+        _ => "Library".into(),
+    }
+}
+
+fn format_duration(ticks: i64) -> String {
+    let total = ticks_to_seconds(ticks).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
     }
 }
 
@@ -537,21 +755,27 @@ fn set_loading(weak: &slint::Weak<MainWindow>, loading: bool) {
     });
 }
 
-fn set_view_title(weak: &slint::Weak<MainWindow>, title: String, subtitle: String) {
+fn set_view_meta(
+    weak: &slint::Weak<MainWindow>,
+    title: String,
+    subtitle: String,
+    collection_type: String,
+) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(w) = weak.upgrade() {
             w.set_view_title(SharedString::from(title));
             w.set_view_subtitle(SharedString::from(subtitle));
+            w.set_view_collection_type(SharedString::from(collection_type));
         }
     });
 }
 
-fn set_view_collection_type(weak: &slint::Weak<MainWindow>, ct: String) {
+fn set_can_go_back(weak: &slint::Weak<MainWindow>, can: bool) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(w) = weak.upgrade() {
-            w.set_view_collection_type(SharedString::from(ct));
+            w.set_can_go_back(can);
         }
     });
 }
@@ -568,6 +792,7 @@ fn set_items(weak: &slint::Weak<MainWindow>, items: Vec<ItemData>) {
                     subtitle: SharedString::from(d.subtitle),
                     image: slint::Image::default(),
                     has_image: false,
+                    item_type: SharedString::from(d.item_type),
                 })
                 .collect();
             w.set_items(ModelRc::new(VecModel::from(slint_items)));
@@ -575,11 +800,8 @@ fn set_items(weak: &slint::Weak<MainWindow>, items: Vec<ItemData>) {
     });
 }
 
-/// Mutate a single item's image in place. We build the `slint::Image`
-/// inside the UI-thread closure because Slint's image types aren't
-/// `Send`; only the raw bytes cross the thread boundary. Epoch is
-/// re-checked on the UI thread so two `set_items` calls in quick
-/// succession can't race with image arrivals from a previous view.
+/// Update a single card's image. Built inside the UI-thread closure
+/// because `slint::Image` isn't `Send`; only raw RGBA crosses threads.
 fn push_item_image(
     weak: &slint::Weak<MainWindow>,
     epoch_ref: Arc<AtomicU64>,
@@ -609,11 +831,7 @@ fn push_item_image(
     });
 }
 
-fn push_signed_in(
-    weak: &slint::Weak<MainWindow>,
-    user_name: &str,
-    views: Vec<jellyfin_api::BaseItemDto>,
-) {
+fn push_signed_in(weak: &slint::Weak<MainWindow>, user_name: &str, views: Vec<BaseItemDto>) {
     let weak = weak.clone();
     let user_name = SharedString::from(user_name);
     let view_items: Vec<ViewItem> = views
@@ -647,6 +865,7 @@ fn push_signed_out(weak: &slint::Weak<MainWindow>) {
             w.set_items(ModelRc::new(VecModel::<Item>::default()));
             w.set_view_title(SharedString::default());
             w.set_view_subtitle(SharedString::default());
+            w.set_can_go_back(false);
             w.set_screen(Screen::Login);
         }
     });
