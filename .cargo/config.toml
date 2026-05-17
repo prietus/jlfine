@@ -1,0 +1,8 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-L", "/usr/local/lib"]
+
+[env]
+PKG_CONFIG_PATH = { value = "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig", relative = false, force = false }
