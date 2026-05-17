@@ -13,6 +13,14 @@ export struct ViewItem {
     collection-type: string,
 }
 
+export struct Item {
+    id: string,
+    title: string,
+    subtitle: string,
+    image: image,
+    has-image: bool,
+}
+
 export enum Screen { login, library }
 
 // --- design tokens -------------------------------------------------
@@ -185,11 +193,75 @@ component SidebarRow inherits TouchArea {
     }
 }
 
+component Card inherits Rectangle {
+    in property <Item> data;
+    width: 180px;
+    height: 250px;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 180px;
+        height: 180px;
+        border-radius: 10px;
+        clip: true;
+        background: #1a1d24;
+        // Placeholder gradient while the image streams in.
+        if !root.data.has-image: Rectangle {
+            background: @linear-gradient(135deg, #1f2330 0%, #181b22 100%);
+        }
+        if root.data.has-image: Image {
+            source: root.data.image;
+            width: 100%;
+            height: 100%;
+            image-fit: cover;
+            opacity: 1.0;
+            animate opacity { duration: 220ms; easing: ease-out; }
+        }
+        // Hover lift.
+        states [
+            hovered when ta.has-hover: {
+                drop-shadow-blur: 24px;
+                drop-shadow-color: #00000080;
+                drop-shadow-offset-y: 8px;
+            }
+        ]
+        animate drop-shadow-blur, drop-shadow-offset-y { duration: 180ms; easing: ease-out; }
+    }
+
+    Text {
+        x: 4px;
+        y: 188px;
+        width: 172px;
+        text: root.data.title;
+        color: Theme.text-primary;
+        font-size: 13px;
+        font-weight: 500;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+    Text {
+        x: 4px;
+        y: 224px;
+        width: 172px;
+        text: root.data.subtitle;
+        color: Theme.text-muted;
+        font-size: 11px;
+        overflow: elide;
+    }
+
+    ta := TouchArea { }
+}
+
 component LibraryScreen inherits Rectangle {
     in property <[ViewItem]> views;
     in property <string> user-name;
     in property <int> selected-index;
-    callback select-view(int);
+    in property <[Item]> items;
+    in property <bool> loading;
+    in property <string> view-title;
+    in property <string> view-subtitle;
+    callback select-view(int, string, string);
     callback sign-out();
 
     background: Theme.bg-base;
@@ -223,7 +295,7 @@ component LibraryScreen inherits Rectangle {
                 for v[i] in root.views: SidebarRow {
                     label: v.name;
                     selected: i == root.selected-index;
-                    clicked => { root.select-view(i); }
+                    clicked => { root.select-view(i, v.id, v.collection-type); }
                 }
 
                 Rectangle { vertical-stretch: 1; }
@@ -252,30 +324,57 @@ component LibraryScreen inherits Rectangle {
         Rectangle {
             background: Theme.bg-base;
 
+            // Header sits above the scrollable grid. Both share horizontal
+            // padding so titles align with the leftmost card.
             VerticalLayout {
-                padding: 32px;
-                spacing: 18px;
+                padding-left: 0px;
+                padding-right: 0px;
+                padding-top: 0px;
+                padding-bottom: 0px;
+                spacing: 0;
 
-                Text {
-                    text: root.views.length > 0 && root.selected-index >= 0
-                        ? root.views[root.selected-index].name
-                        : "No library selected";
-                    color: Theme.text-primary;
-                    font-size: 26px;
-                    font-weight: 600;
+                Rectangle {
+                    height: 88px;
+                    background: Theme.bg-base;
+                    Text {
+                        x: 32px;
+                        y: 28px;
+                        text: root.view-title;
+                        color: Theme.text-primary;
+                        font-size: 26px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        x: 32px;
+                        y: 60px;
+                        text: root.view-subtitle;
+                        color: Theme.text-muted;
+                        font-size: 13px;
+                    }
+                    Text {
+                        x: parent.width - self.width - 32px;
+                        y: 32px;
+                        visible: root.loading;
+                        text: "Loading…";
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                    }
                 }
-                Text {
-                    text: root.views.length > 0 && root.selected-index >= 0
-                        ? "Type: " + root.views[root.selected-index].collection-type
-                        : "";
-                    color: Theme.text-muted;
-                    font-size: 13px;
-                }
-                Rectangle { vertical-stretch: 1; }
-                Text {
-                    text: "Browse coming next iteration.";
-                    color: Theme.text-muted;
-                    font-size: 12px;
+
+                // Grid of cards. We compute x/y manually so it wraps based
+                // on the available width without needing a flow layout
+                // primitive (Slint doesn't have one out of the box).
+                Flickable {
+                    property <int> cols: max(1, floor((self.width - 32px - 32px) / (180px + 20px)));
+                    property <int> rows: ceil(root.items.length / max(1, self.cols));
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, self.rows * (250px + 20px) + 32px);
+
+                    for it[i] in root.items: Card {
+                        x: 32px + mod(i, parent.cols) * (180px + 20px);
+                        y: 16px + floor(i / max(1, parent.cols)) * (250px + 20px);
+                        data: it;
+                    }
                 }
             }
         }
@@ -299,10 +398,14 @@ export component MainWindow inherits Window {
     in property <string> user-name: "";
     in property <[ViewItem]> views: [];
     in-out property <int> selected-view: 0;
+    in property <[Item]> items: [];
+    in property <bool> loading: false;
+    in property <string> view-title: "";
+    in property <string> view-subtitle: "";
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
-    callback view-selected(int);
+    callback view-selected(string, string);
 
     // Two screens; cross-fade between them with opacity.
     login := LoginScreen {
@@ -334,9 +437,13 @@ export component MainWindow inherits Window {
         views: root.views;
         user-name: root.user-name;
         selected-index: root.selected-view;
-        select-view(i) => {
+        items: root.items;
+        loading: root.loading;
+        view-title: root.view-title;
+        view-subtitle: root.view-subtitle;
+        select-view(i, id, ct) => {
             root.selected-view = i;
-            root.view-selected(i);
+            root.view-selected(id, ct);
         }
         sign-out => { root.sign-out-clicked(); }
     }

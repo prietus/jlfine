@@ -2588,8 +2588,11 @@ name = "jelly-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
+ "image",
  "jelly-storage",
  "jellyfin-api",
+ "reqwest",
  "slint",
  "slint-build",
  "tokio",

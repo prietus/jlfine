@@ -5,25 +5,31 @@
 //! tokio runtime that handles all networking against jellyfin-api and
 //! all persistence against jelly-storage. Commands flow UI → backend
 //! via an mpsc channel; updates flow backend → UI via
-//! `slint::invoke_from_event_loop`, which is the only thread-safe way
-//! to mutate window state in Slint.
+//! `slint::invoke_from_event_loop`, the only thread-safe way to mutate
+//! window state in Slint.
 
 #![allow(clippy::needless_return)]
 
 use anyhow::{Context, Result};
 use jelly_storage::Storage;
-use jellyfin_api::{Client, Identity};
-use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use jellyfin_api::{
+    BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
+    SortOrder, image_url,
+};
+use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tracing::{error, info, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 slint::include_modules!();
 
-/// Entry point. Boots the UI, the tokio runtime, and the storage layer
-/// in the right order, then runs the Slint event loop until the window
-/// is closed.
+const ITEM_LIMIT: u32 = 200;
+const IMAGE_PARALLELISM: usize = 8;
+const IMAGE_FILL_HEIGHT: u32 = 360; // 2x the card height for retina
+
 pub fn run() -> Result<()> {
     let storage = Arc::new(Storage::new().context("init storage")?);
     let device_id = storage.device_id().context("get device id")?;
@@ -33,9 +39,6 @@ pub fn run() -> Result<()> {
 
     let (cmd_tx, cmd_rx) = unbounded_channel::<BackendCmd>();
 
-    // Backend thread owns the tokio runtime and the long-lived Client.
-    // Any state the UI needs lives in Slint-managed properties; the
-    // backend only ever talks to the window through invoke_from_event_loop.
     {
         let weak = weak.clone();
         let storage = storage.clone();
@@ -48,7 +51,6 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // UI → backend callbacks.
     window.on_sign_in_clicked({
         let cmd_tx = cmd_tx.clone();
         move |server, user, pw| {
@@ -65,7 +67,15 @@ pub fn run() -> Result<()> {
             let _ = cmd_tx.send(BackendCmd::SignOut);
         }
     });
-    // view-selected is purely visual for now; no backend work needed.
+    window.on_view_selected({
+        let cmd_tx = cmd_tx.clone();
+        move |view_id, collection_type| {
+            let _ = cmd_tx.send(BackendCmd::SelectView {
+                view_id: view_id.to_string(),
+                collection_type: collection_type.to_string(),
+            });
+        }
+    });
 
     window.run()?;
     Ok(())
@@ -80,17 +90,18 @@ enum BackendCmd {
         pw: String,
     },
     SignOut,
+    SelectView {
+        view_id: String,
+        collection_type: String,
+    },
 }
 
 async fn backend_loop(
     weak: slint::Weak<MainWindow>,
     storage: Arc<Storage>,
     device_id: String,
-    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<BackendCmd>,
+    mut cmd_rx: UnboundedReceiver<BackendCmd>,
 ) {
-    // Try to restore a saved session up front. If the token is still
-    // valid we jump straight into the library screen; otherwise the
-    // user sees the login screen with the previous server URL prefilled.
     if let Ok(Some(saved)) = storage.load_session() {
         info!(server = %saved.server_url, user = %saved.user_id, "restoring session");
         let identity = make_identity(&device_id);
@@ -99,13 +110,16 @@ async fn backend_loop(
             .with_token(saved.token.clone());
         match client.current_user().await {
             Ok(user) => {
-                if let Ok(views) = client.user_views(&user.id).await {
+                let first_view = if let Ok(views) = client.user_views(&user.id).await {
+                    let first = views.items.first().cloned();
                     push_signed_in(&weak, &user.name, views.items);
+                    first
                 } else {
                     push_signed_in(&weak, &user.name, vec![]);
-                }
-                // store the client so subsequent commands can use it
-                run_authed(weak.clone(), storage.clone(), client, &mut cmd_rx).await;
+                    None
+                };
+                let state = AuthedState::new(weak.clone(), client, user.id);
+                run_authed(state, storage.clone(), first_view, &mut cmd_rx).await;
                 return;
             }
             Err(e) => {
@@ -116,8 +130,6 @@ async fn backend_loop(
         }
     }
 
-    // Main login loop. Stays here until a successful sign-in upgrades
-    // us into the authenticated state.
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             BackendCmd::SignIn { server, user, pw } => {
@@ -126,19 +138,17 @@ async fn backend_loop(
                 let result = attempt_sign_in(&server, &user, &pw, &device_id, &storage).await;
                 set_busy(&weak, false);
                 match result {
-                    Ok((client, user_name, views)) => {
-                        push_signed_in(&weak, &user_name, views);
-                        run_authed(weak.clone(), storage.clone(), client, &mut cmd_rx).await;
+                    Ok((client, user_dto, views)) => {
+                        let first = views.first().cloned();
+                        push_signed_in(&weak, &user_dto.name, views);
+                        let state = AuthedState::new(weak.clone(), client, user_dto.id);
+                        run_authed(state, storage.clone(), first, &mut cmd_rx).await;
                         return;
                     }
-                    Err(e) => {
-                        set_error(&weak, &format!("{e:#}"));
-                    }
+                    Err(e) => set_error(&weak, &format!("{e:#}")),
                 }
             }
-            BackendCmd::SignOut => {
-                // already signed out — ignore
-            }
+            BackendCmd::SignOut | BackendCmd::SelectView { .. } => {}
         }
     }
 }
@@ -149,7 +159,7 @@ async fn attempt_sign_in(
     pw: &str,
     device_id: &str,
     storage: &Storage,
-) -> Result<(Client, String, Vec<jellyfin_api::BaseItemDto>)> {
+) -> Result<(Client, jellyfin_api::UserDto, Vec<BaseItemDto>)> {
     let base = Url::parse(server).with_context(|| format!("invalid URL: {server}"))?;
     let identity = make_identity(device_id);
     let mut client = Client::new(base.clone(), identity).with_accept_language(preferred_language());
@@ -163,29 +173,266 @@ async fn attempt_sign_in(
         .user_views(&user_dto.id)
         .await
         .context("user_views")?;
-    Ok((client, user_dto.name, views.items))
+    Ok((client, user_dto, views.items))
 }
 
-/// After sign-in succeeds, stay in this loop handling logout (and
-/// future authenticated commands) without dropping the Client.
-async fn run_authed(
+// ---------------------------------------------------------------- authed
+
+struct AuthedState {
     weak: slint::Weak<MainWindow>,
+    client: Client,
+    user_id: String,
+    epoch: Arc<AtomicU64>,
+    image_http: reqwest::Client,
+    image_sem: Arc<Semaphore>,
+}
+
+impl AuthedState {
+    fn new(weak: slint::Weak<MainWindow>, client: Client, user_id: String) -> Self {
+        Self {
+            weak,
+            client,
+            user_id,
+            epoch: Arc::new(AtomicU64::new(0)),
+            image_http: reqwest::Client::new(),
+            image_sem: Arc::new(Semaphore::new(IMAGE_PARALLELISM)),
+        }
+    }
+}
+
+async fn run_authed(
+    state: AuthedState,
     storage: Arc<Storage>,
-    _client: Client,
-    cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackendCmd>,
+    initial_view: Option<jellyfin_api::BaseItemDto>,
+    cmd_rx: &mut UnboundedReceiver<BackendCmd>,
 ) {
+    if let Some(v) = initial_view {
+        select_view(&state, &v.id, v.collection_type.as_deref().unwrap_or(""));
+    }
+
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
+            BackendCmd::SelectView {
+                view_id,
+                collection_type,
+            } => {
+                select_view(&state, &view_id, &collection_type);
+            }
             BackendCmd::SignOut => {
                 info!("signing out");
                 if let Err(e) = storage.clear_session() {
                     error!(?e, "clear_session failed");
                 }
-                push_signed_out(&weak);
+                push_signed_out(&state.weak);
                 return;
             }
-            BackendCmd::SignIn { .. } => {
-                warn!("sign-in attempted while already authed; ignoring");
+            BackendCmd::SignIn { .. } => warn!("sign-in while authed; ignoring"),
+        }
+    }
+}
+
+/// Increment the epoch, fetch items, then fire-and-forget the image
+/// downloads. Returns immediately; each image push checks the current
+/// epoch and skips itself if the user has navigated away.
+fn select_view(state: &AuthedState, view_id: &str, collection_type: &str) {
+    let epoch = state.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    debug!(view = view_id, ct = collection_type, epoch, "select view");
+
+    let weak = state.weak.clone();
+    let client = state.client.clone();
+    let user_id = state.user_id.clone();
+    let view_id = view_id.to_string();
+    let collection_type = collection_type.to_string();
+    let epoch_for_task = state.epoch.clone();
+    let image_http = state.image_http.clone();
+    let image_sem = state.image_sem.clone();
+
+    set_loading(&weak, true);
+    set_view_title(&weak, view_title(&collection_type, ""), "Loading…".into());
+    set_items(&weak, vec![]);
+
+    tokio::spawn(async move {
+        let query = items_query_for(&view_id, &collection_type);
+        let resp = match client.items(&user_id, &query).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(?e, "items fetch failed");
+                if epoch_for_task.load(Ordering::SeqCst) == epoch {
+                    set_loading(&weak, false);
+                    set_view_title(&weak, "Error".into(), format!("{e:#}"));
+                }
+                return;
+            }
+        };
+
+        if epoch_for_task.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+
+        let total = resp.total_record_count.unwrap_or(resp.items.len() as i64);
+        let count_label = if total as usize > resp.items.len() {
+            format!("{} of {} items", resp.items.len(), total)
+        } else {
+            format!("{} items", resp.items.len())
+        };
+
+        let items_data = resp
+            .items
+            .iter()
+            .map(|i| build_initial_item_data(i, &collection_type))
+            .collect::<Vec<_>>();
+
+        set_view_title(&weak, view_title(&collection_type, ""), count_label);
+        set_items(&weak, items_data);
+        set_loading(&weak, false);
+
+        // Snapshot of (index, item_id, image_tag) for items that have
+        // a Primary image. The image URL is built locally; tag goes in
+        // the query so server caches don't serve stale art.
+        let base = client.base_url().clone();
+        let to_load: Vec<(usize, String, String)> = resp
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                item.image_tags
+                    .as_ref()
+                    .and_then(|t| t.get("Primary"))
+                    .cloned()
+                    .map(|tag| (i, item.id.clone(), tag))
+            })
+            .collect();
+
+        for (i, item_id, tag) in to_load {
+            let weak = weak.clone();
+            let http = image_http.clone();
+            let sem = image_sem.clone();
+            let epoch_ref = epoch_for_task.clone();
+            let base = base.clone();
+            tokio::spawn(async move {
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                if epoch_ref.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                let url = image_url(
+                    &base,
+                    &item_id,
+                    ApiImageType::Primary,
+                    &ImageOptions {
+                        tag: Some(tag),
+                        fill_height: Some(IMAGE_FILL_HEIGHT),
+                        quality: Some(90),
+                        ..Default::default()
+                    },
+                );
+                match fetch_image(&http, &url).await {
+                    Ok((rgba, w, h)) => {
+                        if epoch_ref.load(Ordering::SeqCst) == epoch {
+                            push_item_image(&weak, epoch_ref.clone(), epoch, i, rgba, w, h);
+                        }
+                    }
+                    Err(e) => debug!(?e, %url, "image fetch failed"),
+                }
+            });
+        }
+    });
+}
+
+/// Decode an image off the UI thread. Returns raw RGBA bytes plus
+/// dimensions so the caller can ship them across the Slint event-loop
+/// boundary (`slint::Image` is not `Send`, so we build it on the UI
+/// thread instead).
+async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32, u32)> {
+    let bytes = http
+        .get(url.as_str())
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let decoded = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u32, u32)> {
+        let img = image::load_from_memory(&bytes)
+            .context("decode")?
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        Ok((img.into_raw(), w, h))
+    })
+    .await
+    .context("join blocking")??;
+    Ok(decoded)
+}
+
+// ---------------------------------------------------------------- mapping
+
+fn items_query_for(view_id: &str, collection_type: &str) -> ItemsQuery {
+    let (types, sort) = match collection_type {
+        "music" => (vec![ItemType::MusicAlbum], vec!["SortName".into()]),
+        "movies" => (
+            vec![ItemType::Movie],
+            vec!["SortName".into(), "ProductionYear".into()],
+        ),
+        "tvshows" => (vec![ItemType::Series], vec!["SortName".into()]),
+        "playlists" => (vec![ItemType::Playlist], vec!["SortName".into()]),
+        _ => (vec![], vec!["SortName".into()]),
+    };
+    ItemsQuery {
+        parent_id: Some(view_id.to_string()),
+        include_item_types: types,
+        sort_by: sort,
+        sort_order: Some(SortOrder::Ascending),
+        limit: Some(ITEM_LIMIT),
+        recursive: Some(true),
+        fields: vec!["PrimaryImageAspectRatio".into(), "Genres".into()],
+        ..Default::default()
+    }
+}
+
+/// Plain-Rust mirror of the Slint `Item` struct used for crossing the
+/// event-loop boundary. The Slint type contains a non-`Send`
+/// `slint::Image`, so we build it inside the UI-thread closure.
+#[derive(Clone)]
+struct ItemData {
+    id: String,
+    title: String,
+    subtitle: String,
+}
+
+fn build_initial_item_data(item: &BaseItemDto, collection_type: &str) -> ItemData {
+    let title = item.name.clone().unwrap_or_default();
+    let subtitle = match collection_type {
+        "music" => item
+            .album_artist
+            .clone()
+            .or_else(|| item.artists.as_ref().and_then(|a| a.first().cloned()))
+            .or_else(|| item.production_year.map(|y| y.to_string()))
+            .unwrap_or_default(),
+        "movies" | "tvshows" => item
+            .production_year
+            .map(|y| y.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    ItemData {
+        id: item.id.clone(),
+        title,
+        subtitle,
+    }
+}
+
+fn view_title(collection_type: &str, fallback: &str) -> String {
+    match collection_type {
+        "music" => "Music".into(),
+        "movies" => "Movies".into(),
+        "tvshows" => "TV Shows".into(),
+        "playlists" => "Playlists".into(),
+        _ => {
+            if fallback.is_empty() {
+                "Library".into()
+            } else {
+                fallback.into()
             }
         }
     }
@@ -210,9 +457,6 @@ fn preferred_language() -> String {
 }
 
 // ---------------------------------------------------------------- UI mutation
-// Every UI mutation must hop through invoke_from_event_loop so it
-// happens on the Slint main thread, regardless of which tokio worker
-// fired the result.
 
 fn set_busy(weak: &slint::Weak<MainWindow>, busy: bool) {
     let weak = weak.clone();
@@ -240,6 +484,78 @@ fn prefill_server_url(weak: &slint::Weak<MainWindow>, url: &str) {
         if let Some(w) = weak.upgrade() {
             w.set_server_url(url);
         }
+    });
+}
+
+fn set_loading(weak: &slint::Weak<MainWindow>, loading: bool) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_loading(loading);
+        }
+    });
+}
+
+fn set_view_title(weak: &slint::Weak<MainWindow>, title: String, subtitle: String) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_view_title(SharedString::from(title));
+            w.set_view_subtitle(SharedString::from(subtitle));
+        }
+    });
+}
+
+fn set_items(weak: &slint::Weak<MainWindow>, items: Vec<ItemData>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            let slint_items: Vec<Item> = items
+                .into_iter()
+                .map(|d| Item {
+                    id: SharedString::from(d.id),
+                    title: SharedString::from(d.title),
+                    subtitle: SharedString::from(d.subtitle),
+                    image: slint::Image::default(),
+                    has_image: false,
+                })
+                .collect();
+            w.set_items(ModelRc::new(VecModel::from(slint_items)));
+        }
+    });
+}
+
+/// Mutate a single item's image in place. We build the `slint::Image`
+/// inside the UI-thread closure because Slint's image types aren't
+/// `Send`; only the raw bytes cross the thread boundary. Epoch is
+/// re-checked on the UI thread so two `set_items` calls in quick
+/// succession can't race with image arrivals from a previous view.
+fn push_item_image(
+    weak: &slint::Weak<MainWindow>,
+    epoch_ref: Arc<AtomicU64>,
+    expected_epoch: u64,
+    index: usize,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if epoch_ref.load(Ordering::SeqCst) != expected_epoch {
+            return;
+        }
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        let model = w.get_items();
+        let Some(mut item) = model.row_data(index) else {
+            return;
+        };
+        let mut buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        item.image = slint::Image::from_rgba8(buffer);
+        item.has_image = true;
+        model.set_row_data(index, item);
     });
 }
 
@@ -278,11 +594,10 @@ fn push_signed_out(weak: &slint::Weak<MainWindow>) {
             w.set_password(SharedString::default());
             w.set_user_name(SharedString::default());
             w.set_views(ModelRc::new(VecModel::<ViewItem>::default()));
+            w.set_items(ModelRc::new(VecModel::<Item>::default()));
+            w.set_view_title(SharedString::default());
+            w.set_view_subtitle(SharedString::default());
             w.set_screen(Screen::Login);
         }
     });
 }
-
-// Keep the unused import quiet on platforms where it isn't pulled in.
-#[allow(dead_code)]
-fn _silence_unused_warning(_tx: UnboundedSender<BackendCmd>) {}
