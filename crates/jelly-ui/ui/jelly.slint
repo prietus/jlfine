@@ -1,0 +1,343 @@
+// jelly desktop client — login + library shell.
+//
+// One window, two screens (login / library) selected by the `screen`
+// property. Backend toggles `busy` while async work is in flight and
+// sets `error-message` on failure. Sign-in inputs come back to the
+// Rust side via the `sign-in` callback.
+
+import { Palette, ScrollView, VerticalBox, LineEdit, Button } from "std-widgets.slint";
+
+export struct ViewItem {
+    id: string,
+    name: string,
+    collection-type: string,
+}
+
+export enum Screen { login, library }
+
+// --- design tokens -------------------------------------------------
+
+global Theme {
+    out property <color> bg-base: #0c0d10;
+    out property <color> bg-panel: #14161b;
+    out property <color> bg-sidebar: #0f1115;
+    out property <color> stroke-faint: #1f242c;
+    out property <color> text-primary: #e6e8ee;
+    out property <color> text-muted: #8a92a3;
+    out property <color> accent: #7c8cff;
+    out property <color> accent-hover: #95a2ff;
+    out property <color> danger: #e35a6a;
+
+    out property <length> radius-card: 14px;
+    out property <length> radius-pill: 28px;
+}
+
+// --- screens -------------------------------------------------------
+
+component LoginScreen inherits Rectangle {
+    in-out property <string> server-url;
+    in-out property <string> username;
+    in-out property <string> password;
+    in property <string> error-message;
+    in property <bool> busy;
+    callback submit();
+
+    background: Theme.bg-base;
+    // soft radial-ish accent in the corner via overlaid rectangles
+    Rectangle {
+        x: -120px;
+        y: -120px;
+        width: 460px;
+        height: 460px;
+        border-radius: 230px;
+        background: @linear-gradient(140deg, #7c8cff44 0%, transparent 60%);
+    }
+    Rectangle {
+        x: parent.width - 200px;
+        y: parent.height - 200px;
+        width: 380px;
+        height: 380px;
+        border-radius: 190px;
+        background: @linear-gradient(320deg, #4f3aff33 0%, transparent 65%);
+    }
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 420px;
+        height: 460px;
+        border-radius: Theme.radius-card;
+        background: Theme.bg-panel;
+        drop-shadow-color: #00000080;
+        drop-shadow-blur: 30px;
+        drop-shadow-offset-y: 8px;
+
+        VerticalLayout {
+            padding: 32px;
+            spacing: 18px;
+
+            Text {
+                text: "jelly";
+                font-size: 32px;
+                font-weight: 700;
+                color: Theme.text-primary;
+            }
+            Text {
+                text: "Sign in to your Jellyfin server.";
+                font-size: 14px;
+                color: Theme.text-muted;
+            }
+
+            Rectangle { height: 4px; }
+
+            Text {
+                text: "Server URL";
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+            server-input := LineEdit {
+                placeholder-text: "https://jelly.example.com";
+                text <=> root.server-url;
+                enabled: !root.busy;
+            }
+
+            Text {
+                text: "Username";
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+            user-input := LineEdit {
+                placeholder-text: "user";
+                text <=> root.username;
+                enabled: !root.busy;
+            }
+
+            Text {
+                text: "Password";
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+            pw-input := LineEdit {
+                input-type: InputType.password;
+                text <=> root.password;
+                enabled: !root.busy;
+                accepted => { root.submit(); }
+            }
+
+            Rectangle { height: 2px; }
+
+            sign-in-btn := TouchArea {
+                height: 44px;
+                enabled: !root.busy;
+                clicked => { root.submit(); }
+
+                Rectangle {
+                    background: parent.has-hover && !root.busy
+                        ? Theme.accent-hover
+                        : Theme.accent;
+                    border-radius: Theme.radius-pill;
+                    animate background { duration: 150ms; easing: ease-out; }
+
+                    Text {
+                        text: root.busy ? "Signing in…" : "Sign in";
+                        color: white;
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.error-message != "": Text {
+                text: root.error-message;
+                color: Theme.danger;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+component SidebarRow inherits TouchArea {
+    in property <string> label;
+    in property <bool> selected;
+    height: 36px;
+
+    Rectangle {
+        background: parent.selected
+            ? #ffffff14
+            : (parent.has-hover ? #ffffff08 : transparent);
+        border-radius: 8px;
+        animate background { duration: 120ms; }
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            alignment: start;
+            Text {
+                text: root.label;
+                color: Theme.text-primary;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+component LibraryScreen inherits Rectangle {
+    in property <[ViewItem]> views;
+    in property <string> user-name;
+    in property <int> selected-index;
+    callback select-view(int);
+    callback sign-out();
+
+    background: Theme.bg-base;
+
+    HorizontalLayout {
+        spacing: 0;
+
+        Rectangle {
+            width: 240px;
+            background: Theme.bg-sidebar;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 6px;
+
+                Text {
+                    text: "jelly";
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: "Signed in as " + root.user-name;
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                }
+
+                Rectangle { height: 12px; }
+                Text { text: "LIBRARIES"; color: Theme.text-muted; font-size: 10px; letter-spacing: 1px; }
+
+                for v[i] in root.views: SidebarRow {
+                    label: v.name;
+                    selected: i == root.selected-index;
+                    clicked => { root.select-view(i); }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                TouchArea {
+                    height: 32px;
+                    clicked => { root.sign-out(); }
+                    Rectangle {
+                        background: parent.has-hover ? #ffffff08 : transparent;
+                        border-radius: 8px;
+                        animate background { duration: 120ms; }
+                        Text {
+                            text: "Sign out";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            x: 14px;
+                        }
+                    }
+                }
+            }
+        }
+
+        // content area
+        Rectangle {
+            background: Theme.bg-base;
+
+            VerticalLayout {
+                padding: 32px;
+                spacing: 18px;
+
+                Text {
+                    text: root.views.length > 0 && root.selected-index >= 0
+                        ? root.views[root.selected-index].name
+                        : "No library selected";
+                    color: Theme.text-primary;
+                    font-size: 26px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.views.length > 0 && root.selected-index >= 0
+                        ? "Type: " + root.views[root.selected-index].collection-type
+                        : "";
+                    color: Theme.text-muted;
+                    font-size: 13px;
+                }
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: "Browse coming next iteration.";
+                    color: Theme.text-muted;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+}
+
+// --- root window ---------------------------------------------------
+
+export component MainWindow inherits Window {
+    title: "jelly";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    background: Theme.bg-base;
+
+    in-out property <Screen> screen: Screen.login;
+    in-out property <string> server-url: "";
+    in-out property <string> username: "";
+    in-out property <string> password: "";
+    in property <string> error-message: "";
+    in property <bool> busy: false;
+    in property <string> user-name: "";
+    in property <[ViewItem]> views: [];
+    in-out property <int> selected-view: 0;
+
+    callback sign-in-clicked(string, string, string);
+    callback sign-out-clicked();
+    callback view-selected(int);
+
+    // Two screens; cross-fade between them with opacity.
+    login := LoginScreen {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        opacity: root.screen == Screen.login ? 1.0 : 0.0;
+        visible: self.opacity > 0.001;
+        animate opacity { duration: 220ms; easing: ease-out; }
+
+        server-url <=> root.server-url;
+        username <=> root.username;
+        password <=> root.password;
+        error-message: root.error-message;
+        busy: root.busy;
+        submit => { root.sign-in-clicked(root.server-url, root.username, root.password); }
+    }
+
+    library := LibraryScreen {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        opacity: root.screen == Screen.library ? 1.0 : 0.0;
+        visible: self.opacity > 0.001;
+        animate opacity { duration: 220ms; easing: ease-out; }
+
+        views: root.views;
+        user-name: root.user-name;
+        selected-index: root.selected-view;
+        select-view(i) => {
+            root.selected-view = i;
+            root.view-selected(i);
+        }
+        sign-out => { root.sign-out-clicked(); }
+    }
+}
