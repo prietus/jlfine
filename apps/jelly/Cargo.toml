@@ -1,0 +1,20 @@
+[package]
+name = "jelly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "jelly"
+path = "src/main.rs"
+
+[dependencies]
+jellyfin-api.workspace = true
+jelly-core.workspace = true
+audio-engine.workspace = true
+video-engine.workspace = true
+jelly-storage.workspace = true
+jelly-ui.workspace = true
