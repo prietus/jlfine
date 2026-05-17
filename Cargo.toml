@@ -42,7 +42,7 @@ bytes = "1"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "linux-native-sync-persistent", "windows-native"] }
 directories = "5"
 slint = "1.8"
 
