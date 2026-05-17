@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use jelly_storage::Storage;
 use jellyfin_api::{
     BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
-    SortOrder, image_url,
+    SortOrder, image_url, video_stream_url,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
@@ -76,6 +76,15 @@ pub fn run() -> Result<()> {
             });
         }
     });
+    window.on_play_item({
+        let cmd_tx = cmd_tx.clone();
+        move |item_id, collection_type| {
+            let _ = cmd_tx.send(BackendCmd::PlayItem {
+                item_id: item_id.to_string(),
+                collection_type: collection_type.to_string(),
+            });
+        }
+    });
 
     window.run()?;
     Ok(())
@@ -92,6 +101,10 @@ enum BackendCmd {
     SignOut,
     SelectView {
         view_id: String,
+        collection_type: String,
+    },
+    PlayItem {
+        item_id: String,
         collection_type: String,
     },
 }
@@ -148,7 +161,7 @@ async fn backend_loop(
                     Err(e) => set_error(&weak, &format!("{e:#}")),
                 }
             }
-            BackendCmd::SignOut | BackendCmd::SelectView { .. } => {}
+            BackendCmd::SignOut | BackendCmd::SelectView { .. } | BackendCmd::PlayItem { .. } => {}
         }
     }
 }
@@ -218,6 +231,12 @@ async fn run_authed(
             } => {
                 select_view(&state, &view_id, &collection_type);
             }
+            BackendCmd::PlayItem {
+                item_id,
+                collection_type,
+            } => {
+                play_item(&state, &item_id, &collection_type);
+            }
             BackendCmd::SignOut => {
                 info!("signing out");
                 if let Err(e) = storage.clear_session() {
@@ -227,6 +246,27 @@ async fn run_authed(
                 return;
             }
             BackendCmd::SignIn { .. } => warn!("sign-in while authed; ignoring"),
+        }
+    }
+}
+
+fn play_item(state: &AuthedState, item_id: &str, collection_type: &str) {
+    match collection_type {
+        "movies" => {
+            let Some(token) = state.client.token() else {
+                warn!("no token; cannot play");
+                return;
+            };
+            let url = video_stream_url(state.client.base_url(), item_id, token);
+            info!(%url, "play movie");
+            video_engine::play(url.to_string());
+        }
+        other => {
+            info!(
+                item = item_id,
+                ct = other,
+                "playback for this type not wired yet"
+            );
         }
     }
 }
@@ -249,6 +289,7 @@ fn select_view(state: &AuthedState, view_id: &str, collection_type: &str) {
 
     set_loading(&weak, true);
     set_view_title(&weak, view_title(&collection_type, ""), "Loading…".into());
+    set_view_collection_type(&weak, collection_type.clone());
     set_items(&weak, vec![]);
 
     tokio::spawn(async move {
@@ -502,6 +543,15 @@ fn set_view_title(weak: &slint::Weak<MainWindow>, title: String, subtitle: Strin
         if let Some(w) = weak.upgrade() {
             w.set_view_title(SharedString::from(title));
             w.set_view_subtitle(SharedString::from(subtitle));
+        }
+    });
+}
+
+fn set_view_collection_type(weak: &slint::Weak<MainWindow>, ct: String) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_view_collection_type(SharedString::from(ct));
         }
     });
 }

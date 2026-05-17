@@ -12,6 +12,7 @@ slint.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 jellyfin-api.workspace = true
 jelly-storage.workspace = true
+video-engine.workspace = true
 anyhow.workspace = true
 url.workspace = true
 tracing.workspace = true

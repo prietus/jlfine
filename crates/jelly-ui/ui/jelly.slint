@@ -195,6 +195,7 @@ component SidebarRow inherits TouchArea {
 
 component Card inherits Rectangle {
     in property <Item> data;
+    callback clicked();
     width: 180px;
     height: 250px;
 
@@ -250,7 +251,10 @@ component Card inherits Rectangle {
         overflow: elide;
     }
 
-    ta := TouchArea { }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
 }
 
 component LibraryScreen inherits Rectangle {
@@ -261,8 +265,10 @@ component LibraryScreen inherits Rectangle {
     in property <bool> loading;
     in property <string> view-title;
     in property <string> view-subtitle;
+    in property <string> view-collection-type;
     callback select-view(int, string, string);
     callback sign-out();
+    callback item-clicked(string, string);
 
     background: Theme.bg-base;
 
@@ -374,6 +380,9 @@ component LibraryScreen inherits Rectangle {
                         x: 32px + mod(i, parent.cols) * (180px + 20px);
                         y: 16px + floor(i / max(1, parent.cols)) * (250px + 20px);
                         data: it;
+                        clicked => {
+                            root.item-clicked(it.id, root.view-collection-type);
+                        }
                     }
                 }
             }
@@ -402,10 +411,12 @@ export component MainWindow inherits Window {
     in property <bool> loading: false;
     in property <string> view-title: "";
     in property <string> view-subtitle: "";
+    in property <string> view-collection-type: "";
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
     callback view-selected(string, string);
+    callback play-item(string, string);
 
     // Two screens; cross-fade between them with opacity.
     login := LoginScreen {
@@ -441,10 +452,12 @@ export component MainWindow inherits Window {
         loading: root.loading;
         view-title: root.view-title;
         view-subtitle: root.view-subtitle;
+        view-collection-type: root.view-collection-type;
         select-view(i, id, ct) => {
             root.selected-view = i;
             root.view-selected(id, ct);
         }
         sign-out => { root.sign-out-clicked(); }
+        item-clicked(id, ct) => { root.play-item(id, ct); }
     }
 }

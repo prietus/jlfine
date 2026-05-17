@@ -2598,6 +2598,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "video-engine",
 ]
 
 [[package]]
@@ -5697,6 +5698,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "video-engine"
 version = "0.1.0"
+dependencies = [
+ "libmpv2",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "vtable"
