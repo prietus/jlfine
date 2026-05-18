@@ -233,7 +233,91 @@ fn play_blocking(
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn play_blocking(
+    url: &str,
+    container: Option<&str>,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    use symphonia::core::codecs::{Decoder, DecoderOptions};
+    use symphonia::core::formats::{FormatOptions, FormatReader};
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    tracing::info!(%url, ?container, "opening stream");
+    let resp = reqwest::blocking::get(url)?.error_for_status()?;
+    let stream = HttpStream::new(resp);
+    let mss = MediaSourceStream::new(Box::new(stream), MediaSourceStreamOptions::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = container {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| Error::Decode(e.to_string()))?;
+    let format: Box<dyn FormatReader> = probed.format;
+
+    let (track_id, codec_params) = {
+        let track = format
+            .default_track()
+            .ok_or_else(|| Error::Decode("no default track".into()))?;
+        (track.id, track.codec_params.clone())
+    };
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| Error::Decode("missing sample rate".into()))?;
+    let channels = codec_params
+        .channels
+        .ok_or_else(|| Error::Decode("missing channels".into()))?
+        .count() as u32;
+    tracing::info!(sample_rate, channels, "stream format probed");
+
+    let decoder: Box<dyn Decoder> = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| Error::Decode(e.to_string()))?;
+
+    let capacity = (sample_rate as usize) * (channels as usize) * 2;
+    let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity);
+
+    let eof = Arc::new(AtomicBool::new(false));
+    let eof_dec = eof.clone();
+    let cancel_dec = cancel.clone();
+    let decoder_handle = thread::Builder::new()
+        .name("audio-decoder".into())
+        .spawn(move || {
+            let mut producer = producer;
+            decode_loop(format, decoder, track_id, &mut producer, &cancel_dec);
+            eof_dec.store(true, Ordering::Release);
+            tracing::info!("decoder finished");
+        })
+        .expect("spawn decoder thread");
+
+    let result = linux::play_stream(
+        consumer,
+        sample_rate as f64,
+        channels,
+        audio_device,
+        exclusive,
+        &cancel,
+        eof.clone(),
+    );
+
+    cancel.store(true, Ordering::SeqCst);
+    let _ = decoder_handle.join();
+    result.map_err(|e| Error::Backend(format!("{e:?}")))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn play_blocking(
     _url: &str,
     _container: Option<&str>,
@@ -244,7 +328,7 @@ fn play_blocking(
     Err(Error::Unsupported)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn decode_loop(
     mut format: Box<dyn symphonia::core::formats::FormatReader>,
     mut decoder: Box<dyn symphonia::core::codecs::Decoder>,
@@ -299,7 +383,7 @@ fn decode_loop(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn push_all(producer: &mut rtrb::Producer<f32>, mut samples: &[f32], cancel: &AtomicBool) {
     use std::time::Duration;
     while !samples.is_empty() {
@@ -373,3 +457,6 @@ impl symphonia::core::io::MediaSource for HttpStream {
 
 #[cfg(target_os = "macos")]
 mod mac;
+
+#[cfg(target_os = "linux")]
+mod linux;

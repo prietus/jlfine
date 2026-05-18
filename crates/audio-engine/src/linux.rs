@@ -1,0 +1,241 @@
+//! Linux ALSA backend.
+//!
+//! Opens an ALSA PCM directly on the user-picked device (parsed
+//! from `alsa/hw:CARD,DEV` → `hw:CARD,DEV`) and pumps interleaved
+//! f32 from a SPSC ring buffer to the kernel via blocking
+//! `snd_pcm_writei`. `hw:` devices in ALSA already provide
+//! exclusive access at the kernel level (`EBUSY` if anyone else
+//! holds them) and refuse format conversions — that is the
+//! bitperfect guarantee on Linux.
+//!
+//! Exclusive toggle semantics (mirrors macOS HogMode):
+//! - `exclusive=true` requires an `alsa/hw:` id; anything else
+//!   means the user picked a mixer-routed device and bitperfect
+//!   isn't honest, so we warn and refuse.
+//! - `exclusive=false` opens the device as-is (Pipewire/Pulse
+//!   passthrough is fine), with the system mixer doing whatever
+//!   conversions it wants.
+
+use alsa::pcm::{Access, Format, HwParams, PCM};
+use alsa::{Direction, ValueOr};
+use rtrb::Consumer;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum AlsaError {
+    /// `exclusive=true` but the user picked an id we can't open
+    /// bitperfect (anything that doesn't start with `alsa/hw:`).
+    NotBitperfect(String),
+    Open(alsa::Error),
+    HwParams(alsa::Error),
+    Write(alsa::Error),
+    UnsupportedFormat,
+}
+
+pub fn play_stream(
+    mut consumer: Consumer<f32>,
+    sample_rate: f64,
+    channels: u32,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: &Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
+) -> Result<(), AlsaError> {
+    let device_name = resolve_device(audio_device, exclusive)?;
+    tracing::info!(device = %device_name, exclusive, "opening ALSA PCM");
+
+    let pcm = PCM::new(&device_name, Direction::Playback, false).map_err(AlsaError::Open)?;
+
+    // Prefer FloatLE — symphonia hands us f32 and writei accepts it
+    // natively, no integer conversion. Most consumer DACs accept it;
+    // hw: devices that don't (some pro cards locked at S32_LE) need
+    // the fallback. Try FloatLE → S32LE → fail.
+    let format = pick_format(&pcm, sample_rate, channels).map_err(|e| {
+        tracing::error!(?e, "no acceptable hw format negotiated");
+        AlsaError::UnsupportedFormat
+    })?;
+    tracing::info!(format = ?format, "negotiated format");
+
+    // ~85 ms buffer at 48k: 4 periods × 1024 frames. Small enough to
+    // stay responsive on stop/seek, large enough to absorb decoder
+    // jitter without underrunning a hw: PCM.
+    let buffer_frames: u32 = 4096;
+    let period_frames: u32 = 1024;
+    {
+        let hwp = HwParams::any(&pcm).map_err(AlsaError::HwParams)?;
+        hwp.set_channels(channels).map_err(AlsaError::HwParams)?;
+        hwp.set_rate(sample_rate as u32, ValueOr::Nearest)
+            .map_err(AlsaError::HwParams)?;
+        hwp.set_format(format).map_err(AlsaError::HwParams)?;
+        hwp.set_access(Access::RWInterleaved)
+            .map_err(AlsaError::HwParams)?;
+        hwp.set_buffer_size_near(buffer_frames as i64)
+            .map_err(AlsaError::HwParams)?;
+        hwp.set_period_size_near(period_frames as i64, ValueOr::Nearest)
+            .map_err(AlsaError::HwParams)?;
+        pcm.hw_params(&hwp).map_err(AlsaError::HwParams)?;
+    }
+
+    // Prefill ~200 ms before opening the floodgates — same rationale
+    // as macOS: tiny safety margin so the very first writei sees a
+    // healthy chunk and the DAC's PLL has time to lock onto the
+    // chosen sample rate before audio actually starts coming out.
+    {
+        let target = (sample_rate as usize) * (channels as usize) / 5;
+        let start = Instant::now();
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if eof.load(Ordering::Acquire) {
+                break;
+            }
+            if consumer.slots() >= target {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                tracing::warn!(slots = consumer.slots(), "prefill timeout");
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        tracing::info!(slots = consumer.slots(), "prefill done");
+    }
+
+    pcm.prepare().map_err(AlsaError::Open)?;
+
+    // Working buffer the size of one period. We pull from rtrb in
+    // chunks of period_frames (channels * period_frames samples)
+    // and feed snd_pcm_writei. writei blocks until there's room,
+    // so the throttling falls out for free — no manual sleep.
+    let chunk_samples = (period_frames as usize) * (channels as usize);
+    let mut f32_buf: Vec<f32> = vec![0.0; chunk_samples];
+    let mut i32_buf: Vec<i32> = if matches!(format, Format::S32LE) {
+        vec![0; chunk_samples]
+    } else {
+        Vec::new()
+    };
+
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+
+        let avail = consumer.slots();
+        if avail == 0 {
+            if eof.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let take = avail.min(chunk_samples);
+
+        // Drain the chunk out of the ring buffer.
+        let chunk = match consumer.read_chunk(take) {
+            Ok(c) => c,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        };
+        let (s1, s2) = chunk.as_slices();
+        f32_buf[..s1.len()].copy_from_slice(s1);
+        f32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
+        chunk.commit_all();
+
+        let frames_to_write = take / channels as usize;
+        let write_result = match format {
+            Format::FloatLE => {
+                let io = pcm.io_f32().map_err(AlsaError::Write)?;
+                io.writei(&f32_buf[..take])
+            }
+            Format::S32LE => {
+                // Saturating f32 → i32. Symphonia normalises to
+                // [-1.0, 1.0] but rounding can drift; clamp before
+                // scaling so we never wrap past `i32::MIN/MAX`.
+                for (dst, src) in i32_buf[..take].iter_mut().zip(&f32_buf[..take]) {
+                    let v = src.clamp(-1.0, 1.0) * 2147483647.0;
+                    *dst = v as i32;
+                }
+                let io = pcm.io_i32().map_err(AlsaError::Write)?;
+                io.writei(&i32_buf[..take])
+            }
+            _ => return Err(AlsaError::UnsupportedFormat),
+        };
+
+        match write_result {
+            Ok(written) if written == frames_to_write => {}
+            Ok(written) => {
+                tracing::trace!(written, frames_to_write, "short write");
+            }
+            Err(e) => {
+                // Hand it to ALSA's own recovery first: it knows
+                // about EPIPE (underrun) vs ESTRPIPE (suspended)
+                // and will `snd_pcm_prepare` for us where
+                // appropriate. Only escalate if recovery itself
+                // fails.
+                tracing::warn!(?e, "writei error, attempting recover");
+                pcm.try_recover(e, true).map_err(AlsaError::Write)?;
+            }
+        }
+    }
+
+    // Best-effort drain. If the user hit stop we don't care; if EOF
+    // brought us here, this empties the kernel ring so the last few
+    // ms actually reach the DAC.
+    let _ = pcm.drain();
+    Ok(())
+}
+
+fn resolve_device(audio_device: Option<&str>, exclusive: bool) -> Result<String, AlsaError> {
+    let raw = audio_device.unwrap_or("");
+
+    // Empty / `auto` / not-an-alsa id → system default. In shared
+    // mode that's fine; in exclusive mode it's a lie — refuse so the
+    // user notices their pick was wrong, rather than silently
+    // routing through Pipewire while we claim to be bitperfect.
+    let alsa_inner = raw.strip_prefix("alsa/");
+
+    if exclusive {
+        match alsa_inner {
+            Some(rest) if rest.starts_with("hw:") => Ok(rest.to_string()),
+            _ => Err(AlsaError::NotBitperfect(raw.to_string())),
+        }
+    } else {
+        match alsa_inner {
+            Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
+            _ => Ok("default".to_string()),
+        }
+    }
+}
+
+fn pick_format(pcm: &PCM, sample_rate: f64, channels: u32) -> Result<Format, alsa::Error> {
+    for fmt in [Format::FloatLE, Format::S32LE] {
+        let hwp = HwParams::any(pcm)?;
+        if hwp.set_channels(channels).is_err() {
+            continue;
+        }
+        if hwp.set_rate(sample_rate as u32, ValueOr::Nearest).is_err() {
+            continue;
+        }
+        if hwp.set_access(Access::RWInterleaved).is_err() {
+            continue;
+        }
+        if hwp.set_format(fmt).is_ok() {
+            return Ok(fmt);
+        }
+    }
+    // Fall back through a generic params probe to surface a real
+    // error from ALSA rather than our own enum variant.
+    let hwp = HwParams::any(pcm)?;
+    hwp.set_channels(channels)?;
+    hwp.set_rate(sample_rate as u32, ValueOr::Nearest)?;
+    hwp.set_access(Access::RWInterleaved)?;
+    hwp.set_format(Format::FloatLE)?;
+    Ok(Format::FloatLE)
+}
