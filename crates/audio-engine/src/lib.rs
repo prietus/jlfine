@@ -35,6 +35,8 @@ enum Cmd {
     Play {
         url: String,
         container: Option<String>,
+        audio_device: Option<String>,
+        exclusive: bool,
     },
     Stop,
 }
@@ -58,12 +60,30 @@ impl AudioEngine {
     /// Replace the current playback. Returns immediately; the worker
     /// thread cancels any in-flight track, waits for HogMode release,
     /// then opens the new HTTP stream and starts decode + playback.
+    ///
     /// `container` is a hint for symphonia's format probe (e.g.
     /// `Some("flac")`, `Some("m4a")`).
-    pub fn play_track(&self, url: impl Into<String>, container: Option<String>) {
+    ///
+    /// `audio_device` is the mpv-style id (`coreaudio/<UID>` on
+    /// macOS, `alsa/hw:CARD,DEV` on Linux). `None` falls back to the
+    /// platform default output.
+    ///
+    /// `exclusive=true` is the bitperfect path: HogMode + sample-rate
+    /// switching on macOS. `false` opens the device without taking
+    /// exclusive control or touching the nominal sample rate — the
+    /// system mixer may resample, so this is *not* bitperfect.
+    pub fn play_track(
+        &self,
+        url: impl Into<String>,
+        container: Option<String>,
+        audio_device: Option<String>,
+        exclusive: bool,
+    ) {
         let _ = self.tx.send(Cmd::Play {
             url: url.into(),
             container,
+            audio_device,
+            exclusive,
         });
     }
 
@@ -96,13 +116,24 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
 
         match cmd {
             Cmd::Stop => continue,
-            Cmd::Play { url, container } => {
+            Cmd::Play {
+                url,
+                container,
+                audio_device,
+                exclusive,
+            } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 let cancel_clone = cancel.clone();
                 let handle = thread::Builder::new()
                     .name("audio-playback".into())
                     .spawn(move || {
-                        if let Err(e) = play_blocking(&url, container.as_deref(), cancel_clone) {
+                        if let Err(e) = play_blocking(
+                            &url,
+                            container.as_deref(),
+                            audio_device.as_deref(),
+                            exclusive,
+                            cancel_clone,
+                        ) {
                             tracing::error!(?e, "audio playback failed");
                         }
                     })
@@ -115,7 +146,13 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
 }
 
 #[cfg(target_os = "macos")]
-fn play_blocking(url: &str, container: Option<&str>, cancel: Arc<AtomicBool>) -> Result<()> {
+fn play_blocking(
+    url: &str,
+    container: Option<&str>,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     use symphonia::core::codecs::{Decoder, DecoderOptions};
     use symphonia::core::formats::{FormatOptions, FormatReader};
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -177,7 +214,15 @@ fn play_blocking(url: &str, container: Option<&str>, cancel: Arc<AtomicBool>) ->
         })
         .expect("spawn decoder thread");
 
-    let result = mac::play_stream(consumer, sample_rate as f64, channels, &cancel, eof.clone());
+    let result = mac::play_stream(
+        consumer,
+        sample_rate as f64,
+        channels,
+        audio_device,
+        exclusive,
+        &cancel,
+        eof.clone(),
+    );
 
     // If HAL bails out first, the decoder may still be blocked in a
     // socket read — flip cancel so the next read break causes it to
@@ -189,7 +234,13 @@ fn play_blocking(url: &str, container: Option<&str>, cancel: Arc<AtomicBool>) ->
 }
 
 #[cfg(not(target_os = "macos"))]
-fn play_blocking(_url: &str, _container: Option<&str>, _cancel: Arc<AtomicBool>) -> Result<()> {
+fn play_blocking(
+    _url: &str,
+    _container: Option<&str>,
+    _audio_device: Option<&str>,
+    _exclusive: bool,
+    _cancel: Arc<AtomicBool>,
+) -> Result<()> {
     Err(Error::Unsupported)
 }
 

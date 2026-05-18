@@ -18,8 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use std::{mem, process, ptr, thread};
 
-const DEFAULT_DEVICE_SUBSTRING: &str = "xDuoo";
-
 /// HAL-level errors. The `i32` payload is the raw `OSStatus`; it's
 /// consumed via `Debug` when bubbling up through
 /// `Error::Backend(format!(...))`, which dead-code analysis can't see.
@@ -38,12 +36,14 @@ pub fn play_stream(
     consumer: Consumer<f32>,
     sample_rate: f64,
     channels: u32,
+    audio_device: Option<&str>,
+    exclusive: bool,
     cancel: &Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
 ) -> Result<(), HalError> {
-    let device_id = select_device(DEFAULT_DEVICE_SUBSTRING)?;
+    let device_id = resolve_device(audio_device)?;
     let device_name = get_device_name(device_id).unwrap_or_else(|| "?".into());
-    tracing::info!(device_id, device_name = %device_name, "selected output device");
+    tracing::info!(device_id, device_name = %device_name, exclusive, "selected output device");
 
     // Wait for ~200 ms of audio to accumulate (or EOF if the track is
     // shorter than the prefill) before we touch the DAC. This + the
@@ -79,18 +79,27 @@ pub fn play_stream(
         state_ptr: ptr::null_mut(),
     };
 
-    session.took_hog = acquire_hog_mode(device_id)?;
-    tracing::info!(took_hog = session.took_hog, pid = process::id(), "hog mode");
+    // Exclusive (bitperfect) path: take HogMode and force the
+    // device's nominal sample rate to match the source. Shared path:
+    // leave both alone — the audio stays interruptible by other apps
+    // and the system mixer will resample. Caller knows what they
+    // asked for.
+    if exclusive {
+        session.took_hog = acquire_hog_mode(device_id)?;
+        tracing::info!(took_hog = session.took_hog, pid = process::id(), "hog mode");
 
-    let prev_rate = get_nominal_sample_rate(device_id)?;
-    set_nominal_sample_rate(device_id, sample_rate)?;
-    let new_rate = get_nominal_sample_rate(device_id)?;
-    tracing::info!(
-        prev_rate,
-        target = sample_rate,
-        now = new_rate,
-        "device rate"
-    );
+        let prev_rate = get_nominal_sample_rate(device_id)?;
+        set_nominal_sample_rate(device_id, sample_rate)?;
+        let new_rate = get_nominal_sample_rate(device_id)?;
+        tracing::info!(
+            prev_rate,
+            target = sample_rate,
+            now = new_rate,
+            "device rate"
+        );
+    } else {
+        tracing::info!("shared mode: skipping HogMode and rate switch");
+    }
 
     let state = Box::new(PlayerState {
         consumer,
@@ -219,21 +228,35 @@ fn name_property() -> AudioObjectPropertyAddress {
         mElement: kAudioObjectPropertyElementMain,
     }
 }
+fn uid_property() -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyDeviceUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    }
+}
 
 // ------------------------------------------------------ discovery
 
-fn select_device(substr: &str) -> Result<AudioObjectID, HalError> {
-    for id in list_devices()? {
-        if let Some(n) = get_device_name(id) {
-            if n.to_lowercase().contains(&substr.to_lowercase()) {
+/// Map the persisted `audio_device` id (mpv-style) to a HAL device.
+/// `coreaudio/<UID>` resolves via `kAudioDevicePropertyDeviceUID`;
+/// anything else (None, `coreaudio/` with no UID, a non-CoreAudio id
+/// that drifted in from another platform) falls back to the system
+/// default output.
+fn resolve_device(audio_device: Option<&str>) -> Result<AudioObjectID, HalError> {
+    let uid = audio_device
+        .and_then(|s| s.strip_prefix("coreaudio/"))
+        .filter(|s| !s.is_empty());
+    if let Some(uid) = uid {
+        for id in list_devices()? {
+            if let Some(have) = get_device_uid(id)
+                && have == uid
+            {
                 return Ok(id);
             }
         }
+        tracing::warn!(uid, "preferred device UID not found, using default output");
     }
-    tracing::warn!(
-        substring = substr,
-        "preferred device not found, using default output"
-    );
     default_output_device()
 }
 
@@ -285,7 +308,14 @@ fn default_output_device() -> Result<AudioObjectID, HalError> {
 }
 
 fn get_device_name(id: AudioObjectID) -> Option<String> {
-    let addr = name_property();
+    get_cfstring_property(id, name_property())
+}
+
+fn get_device_uid(id: AudioObjectID) -> Option<String> {
+    get_cfstring_property(id, uid_property())
+}
+
+fn get_cfstring_property(id: AudioObjectID, addr: AudioObjectPropertyAddress) -> Option<String> {
     let mut cf: CFStringRef = ptr::null();
     let mut size = mem::size_of::<CFStringRef>() as u32;
     let s = unsafe {

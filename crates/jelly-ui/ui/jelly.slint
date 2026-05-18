@@ -23,7 +23,13 @@ export struct Item {
     track-index: int,
 }
 
-export enum Screen { login, library }
+export struct AudioDeviceItem {
+    id: string,
+    description: string,
+    bitperfect: bool,
+}
+
+export enum Screen { login, library, settings }
 
 // --- design tokens -------------------------------------------------
 
@@ -348,6 +354,7 @@ component LibraryScreen inherits Rectangle {
     callback sign-out();
     callback activate-item(string, string);
     callback back-clicked();
+    callback open-settings();
 
     background: Theme.bg-base;
 
@@ -384,6 +391,24 @@ component LibraryScreen inherits Rectangle {
                 }
 
                 Rectangle { vertical-stretch: 1; }
+
+                TouchArea {
+                    height: 32px;
+                    clicked => { root.open-settings(); }
+                    Rectangle {
+                        background: parent.has-hover ? #ffffff08 : transparent;
+                        border-radius: 8px;
+                        animate background { duration: 120ms; }
+                        Text {
+                            text: "⚙  Settings";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            x: 14px;
+                        }
+                    }
+                }
 
                 TouchArea {
                     height: 32px;
@@ -554,6 +579,437 @@ component LibraryScreen inherits Rectangle {
     }
 }
 
+// --- settings ------------------------------------------------------
+
+component SettingsTab inherits TouchArea {
+    in property <string> label;
+    in property <string> icon;
+    in property <bool> active;
+    in property <bool> enabled-tab: true;
+    width: 96px;
+    height: 60px;
+    mouse-cursor: root.enabled-tab ? pointer : default;
+
+    Rectangle {
+        background: root.active
+            ? #ffffff0c
+            : (root.has-hover && root.enabled-tab ? #ffffff06 : transparent);
+        border-radius: 10px;
+        animate background { duration: 120ms; }
+
+        VerticalLayout {
+            spacing: 4px;
+            padding: 8px;
+            alignment: center;
+            Text {
+                text: root.icon;
+                color: root.active ? Theme.accent : Theme.text-muted;
+                font-size: 20px;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.label;
+                color: root.active ? Theme.accent : Theme.text-muted;
+                font-size: 11px;
+                font-weight: 500;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+component ToggleSwitch inherits TouchArea {
+    in-out property <bool> value;
+    callback toggled(bool);
+    width: 44px;
+    height: 26px;
+    mouse-cursor: pointer;
+    clicked => {
+        root.value = !root.value;
+        root.toggled(root.value);
+    }
+
+    Rectangle {
+        background: root.value ? Theme.accent : #3a3f4a;
+        border-radius: 13px;
+        animate background { duration: 150ms; easing: ease-out; }
+
+        Rectangle {
+            x: root.value ? parent.width - self.width - 3px : 3px;
+            y: (parent.height - self.height) / 2;
+            width: 20px;
+            height: 20px;
+            border-radius: 10px;
+            background: white;
+            drop-shadow-color: #00000040;
+            drop-shadow-blur: 4px;
+            drop-shadow-offset-y: 1px;
+            animate x { duration: 150ms; easing: ease-out; }
+        }
+    }
+}
+
+component DeviceDropdown inherits Rectangle {
+    in property <[AudioDeviceItem]> devices;
+    in property <string> selected-id;
+    // Resolved display name — backend pushes this when selection or
+    // device list changes, so we don't have to do lookups in Slint
+    // (whose expression language has no looped find-by-key form).
+    in property <string> selected-label;
+    callback select(string);
+
+    property <bool> open: false;
+
+    height: 32px;
+    width: 260px;
+
+    Rectangle {
+        background: #1a1d24;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: trigger.has-hover ? #ffffff20 : Theme.stroke-faint;
+        animate border-color { duration: 120ms; }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 10px;
+            spacing: 8px;
+            Text {
+                text: root.selected-label;
+                color: Theme.text-primary;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: "⌄";
+                color: Theme.text-muted;
+                font-size: 14px;
+                vertical-alignment: center;
+            }
+        }
+
+        trigger := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.open = !root.open; }
+        }
+    }
+
+    // Popup menu — absolutely positioned below the trigger, on top of
+    // surrounding content via z-order (declared after the trigger).
+    Rectangle {
+        x: 0;
+        y: 36px;
+        width: max(parent.width, 340px);
+        height: min(320px, (root.devices.length + 1) * 40px + 8px);
+        background: #14161b;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.stroke-faint;
+        drop-shadow-color: #00000099;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        visible: root.open;
+
+        Flickable {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            height: parent.height - 8px;
+            viewport-width: self.width;
+            viewport-height: (root.devices.length + 1) * 40px;
+
+            // System default row.
+            default-row := TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: 40px;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.select("");
+                    root.open = false;
+                }
+                Rectangle {
+                    background: parent.has-hover ? #ffffff10 : transparent;
+                    border-radius: 6px;
+                    animate background { duration: 100ms; }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: root.selected-id == "" ? "✓" : "";
+                            color: Theme.accent;
+                            width: 14px;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "System default";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+
+            for d[i] in root.devices: TouchArea {
+                x: 0;
+                y: 40px + i * 40px;
+                width: parent.width;
+                height: 40px;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.select(d.id);
+                    root.open = false;
+                }
+                Rectangle {
+                    background: parent.has-hover ? #ffffff10 : transparent;
+                    border-radius: 6px;
+                    animate background { duration: 100ms; }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: d.id == root.selected-id ? "✓" : "";
+                            color: Theme.accent;
+                            width: 14px;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            Text {
+                                text: d.description;
+                                color: Theme.text-primary;
+                                font-size: 13px;
+                                vertical-alignment: bottom;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: d.id;
+                                color: Theme.text-muted;
+                                font-size: 10px;
+                                vertical-alignment: top;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle {
+                            width: d.bitperfect ? 64px : 48px;
+                            height: 18px;
+                            y: (parent.height - self.height) / 2;
+                            background: d.bitperfect ? #4caf5022 : #ffffff10;
+                            border-radius: 9px;
+                            border-width: 1px;
+                            border-color: d.bitperfect ? #4caf5099 : Theme.stroke-faint;
+                            Text {
+                                text: d.bitperfect ? "Bitperfect" : "Mixer";
+                                color: d.bitperfect ? #8fdc92 : Theme.text-muted;
+                                font-size: 9px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SettingsScreen inherits Rectangle {
+    in property <[AudioDeviceItem]> audio-devices;
+    in property <string> selected-audio-device;
+    in property <string> selected-audio-device-label;
+    in-out property <bool> exclusive-mode;
+    in property <bool> devices-loading;
+    callback close();
+    callback select-audio-device(string);
+    callback set-exclusive-mode(bool);
+    callback refresh-devices();
+
+    background: Theme.bg-base;
+
+    // Header with title + close.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 56px;
+        background: Theme.bg-base;
+
+        Text {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            text: "Settings";
+            color: Theme.text-primary;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        done-btn := TouchArea {
+            x: parent.width - self.width - 20px;
+            y: (parent.height - self.height) / 2;
+            width: 64px;
+            height: 30px;
+            mouse-cursor: pointer;
+            clicked => { root.close(); }
+            Rectangle {
+                background: parent.has-hover ? Theme.accent-hover : Theme.accent;
+                border-radius: 15px;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "Done";
+                    color: white;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // Tab strip — only Audio is active for v1. The others are present
+    // for visual parity with the macOS reference design; they'll grow
+    // real content in later iterations (Last.fm scrobble, Jellystat,
+    // Discogs metadata).
+    Rectangle {
+        x: 0;
+        y: 56px;
+        width: parent.width;
+        height: 80px;
+        HorizontalLayout {
+            x: (parent.width - self.width) / 2;
+            spacing: 6px;
+            y: 8px;
+            SettingsTab { label: "Audio";    icon: "🔊"; active: true;  }
+            SettingsTab { label: "Last.fm";  icon: "♬"; enabled-tab: false; }
+            SettingsTab { label: "Jellystat"; icon: "▤"; enabled-tab: false; }
+            SettingsTab { label: "Discogs";  icon: "◎"; enabled-tab: false; }
+        }
+    }
+
+    // Audio panel.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 152px;
+        width: min(720px, parent.width - 80px);
+        height: parent.height - 180px;
+        background: Theme.bg-base;
+
+        VerticalLayout {
+            spacing: 24px;
+
+            // Exclusive mode card.
+            Rectangle {
+                height: 110px;
+                background: Theme.bg-panel;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.stroke-faint;
+
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 6px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Exclusive (bit-perfect) mode";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        ToggleSwitch {
+                            value <=> root.exclusive-mode;
+                            toggled(v) => { root.set-exclusive-mode(v); }
+                        }
+                    }
+                    Text {
+                        text: "Music takes exclusive control of the output device, matches the device's sample rate to the file, and bypasses the system mixer for bit-perfect playback.";
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // Output device card.
+            Rectangle {
+                height: 140px;
+                background: Theme.bg-panel;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: Theme.stroke-faint;
+
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 14px;
+
+                    Text {
+                        text: "Output device";
+                        color: Theme.text-primary;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text {
+                            text: "Device";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        DeviceDropdown {
+                            devices: root.audio-devices;
+                            selected-id: root.selected-audio-device;
+                            selected-label: root.selected-audio-device-label;
+                            select(id) => { root.select-audio-device(id); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        Rectangle { horizontal-stretch: 1; }
+                        refresh-btn := TouchArea {
+                            width: 92px;
+                            height: 30px;
+                            mouse-cursor: pointer;
+                            clicked => { root.refresh-devices(); }
+                            Rectangle {
+                                background: parent.has-hover ? #ffffff14 : #ffffff08;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.stroke-faint;
+                                animate background { duration: 120ms; }
+                                Text {
+                                    text: root.devices-loading ? "Loading…" : "Refresh";
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                    font-weight: 500;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}
+
 // --- root window ---------------------------------------------------
 
 export component MainWindow inherits Window {
@@ -580,12 +1036,21 @@ export component MainWindow inherits Window {
     in property <bool> can-go-back: false;
     in property <image> album-image;
     in property <bool> album-has-image: false;
+    in property <[AudioDeviceItem]> audio-devices: [];
+    in property <string> selected-audio-device: "";
+    in property <string> selected-audio-device-label: "System default";
+    in-out property <bool> exclusive-mode: true;
+    in property <bool> devices-loading: false;
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
     callback view-selected(string, string);
     callback activate-item(string, string);
     callback back-clicked();
+    callback open-settings();
+    callback select-audio-device(string);
+    callback set-exclusive-mode(bool);
+    callback refresh-devices();
 
     // Two screens; cross-fade between them with opacity.
     login := LoginScreen {
@@ -633,5 +1098,26 @@ export component MainWindow inherits Window {
         sign-out => { root.sign-out-clicked(); }
         activate-item(id, ct) => { root.activate-item(id, ct); }
         back-clicked => { root.back-clicked(); }
+        open-settings => { root.open-settings(); }
+    }
+
+    settings-screen := SettingsScreen {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        opacity: root.screen == Screen.settings ? 1.0 : 0.0;
+        visible: self.opacity > 0.001;
+        animate opacity { duration: 220ms; easing: ease-out; }
+
+        audio-devices: root.audio-devices;
+        selected-audio-device: root.selected-audio-device;
+        selected-audio-device-label: root.selected-audio-device-label;
+        exclusive-mode <=> root.exclusive-mode;
+        devices-loading: root.devices-loading;
+        close => { root.screen = Screen.library; }
+        select-audio-device(id) => { root.select-audio-device(id); }
+        set-exclusive-mode(v) => { root.set-exclusive-mode(v); }
+        refresh-devices => { root.refresh-devices(); }
     }
 }

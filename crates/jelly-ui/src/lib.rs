@@ -25,11 +25,13 @@ use jellyfin_api::{
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{debug, error, info, warn};
 use url::Url;
+use video_engine::AudioDevice;
 
 slint::include_modules!();
 
@@ -97,6 +99,40 @@ pub fn run() -> Result<()> {
             let _ = cmd_tx.send(BackendCmd::GoBack);
         }
     });
+    window.on_open_settings({
+        let cmd_tx = cmd_tx.clone();
+        let weak = weak.clone();
+        move || {
+            // Switch screen synchronously so the panel appears
+            // immediately even while the device enumeration is in
+            // flight; the dropdown shows "Loading…" until results
+            // arrive.
+            if let Some(w) = weak.upgrade() {
+                w.set_screen(Screen::Settings);
+            }
+            let _ = cmd_tx.send(BackendCmd::RefreshDevices);
+        }
+    });
+    window.on_select_audio_device({
+        let cmd_tx = cmd_tx.clone();
+        move |id| {
+            let _ = cmd_tx.send(BackendCmd::SelectAudioDevice {
+                id: id.to_string(),
+            });
+        }
+    });
+    window.on_set_exclusive_mode({
+        let cmd_tx = cmd_tx.clone();
+        move |v| {
+            let _ = cmd_tx.send(BackendCmd::SetExclusiveMode { value: v });
+        }
+    });
+    window.on_refresh_devices({
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(BackendCmd::RefreshDevices);
+        }
+    });
 
     window.run()?;
     Ok(())
@@ -120,6 +156,13 @@ enum BackendCmd {
         item_type: String,
     },
     GoBack,
+    RefreshDevices,
+    SelectAudioDevice {
+        id: String,
+    },
+    SetExclusiveMode {
+        value: bool,
+    },
 }
 
 // ---------------------------------------------------------------- nav model
@@ -255,7 +298,9 @@ async fn backend_loop(
                     push_signed_in(&weak, &user.name, vec![]);
                     None
                 };
-                let state = AuthedState::new(weak.clone(), client, user.id);
+                let state = AuthedState::new(weak.clone(), client, user.id, storage.clone());
+                push_initial_audio_state(&state);
+                spawn_device_refresh(&state, /* auto_pick = */ true);
                 run_authed(state, storage.clone(), first_view, &mut cmd_rx).await;
                 return;
             }
@@ -278,7 +323,10 @@ async fn backend_loop(
                     Ok((client, user_dto, views)) => {
                         let first = views.first().cloned();
                         push_signed_in(&weak, &user_dto.name, views);
-                        let state = AuthedState::new(weak.clone(), client, user_dto.id);
+                        let state =
+                            AuthedState::new(weak.clone(), client, user_dto.id, storage.clone());
+                        push_initial_audio_state(&state);
+                        spawn_device_refresh(&state, /* auto_pick = */ true);
                         run_authed(state, storage.clone(), first, &mut cmd_rx).await;
                         return;
                     }
@@ -288,7 +336,10 @@ async fn backend_loop(
             BackendCmd::SignOut
             | BackendCmd::SelectView { .. }
             | BackendCmd::ActivateItem { .. }
-            | BackendCmd::GoBack => {}
+            | BackendCmd::GoBack
+            | BackendCmd::RefreshDevices
+            | BackendCmd::SelectAudioDevice { .. }
+            | BackendCmd::SetExclusiveMode { .. } => {}
         }
     }
 }
@@ -326,10 +377,20 @@ struct AuthedState {
     image_http: reqwest::Client,
     image_sem: Arc<Semaphore>,
     audio: AudioEngine,
+    storage: Arc<Storage>,
+    /// Last device list fetched from mpv. Used to resolve a selected
+    /// id back to a human label and to drive the auto-pick of the
+    /// first bitperfect device on a fresh install.
+    audio_devices: Arc<Mutex<Vec<AudioDevice>>>,
 }
 
 impl AuthedState {
-    fn new(weak: slint::Weak<MainWindow>, client: Client, user_id: String) -> Self {
+    fn new(
+        weak: slint::Weak<MainWindow>,
+        client: Client,
+        user_id: String,
+        storage: Arc<Storage>,
+    ) -> Self {
         Self {
             weak,
             client,
@@ -338,6 +399,8 @@ impl AuthedState {
             image_http: reqwest::Client::new(),
             image_sem: Arc::new(Semaphore::new(IMAGE_PARALLELISM)),
             audio: AudioEngine::new(),
+            storage,
+            audio_devices: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -388,6 +451,23 @@ async fn run_authed(
                 push_signed_out(&state.weak);
                 return;
             }
+            BackendCmd::RefreshDevices => {
+                spawn_device_refresh(&state, /* auto_pick = */ false);
+            }
+            BackendCmd::SelectAudioDevice { id } => {
+                let id_opt = if id.is_empty() { None } else { Some(id.as_str()) };
+                if let Err(e) = storage.set_audio_device(id_opt) {
+                    error!(?e, "persist audio device failed");
+                }
+                let label = resolve_device_label(&state, &id);
+                set_selected_audio_device(&state.weak, &id, &label);
+            }
+            BackendCmd::SetExclusiveMode { value } => {
+                if let Err(e) = storage.set_exclusive_mode(value) {
+                    error!(?e, "persist exclusive mode failed");
+                }
+                set_exclusive_mode(&state.weak, value);
+            }
             BackendCmd::SignIn { .. } => warn!("sign-in while authed; ignoring"),
         }
     }
@@ -421,8 +501,9 @@ async fn activate(
                 return;
             };
             let url = video_stream_url(state.client.base_url(), item_id, token);
-            info!(%url, kind = item_type, "play video");
-            video_engine::play(url.to_string());
+            let audio_device = state.storage.audio_device().ok().flatten();
+            info!(%url, kind = item_type, ?audio_device, "play video");
+            video_engine::play(url.to_string(), audio_device);
         }
         "Audio" => {
             let Some(token) = state.client.token() else {
@@ -436,8 +517,12 @@ async fn activate(
                 .and_then(|m| m.first())
                 .and_then(|s| s.container.clone());
             let url = audio_stream_url(state.client.base_url(), item_id, token);
-            info!(%url, container = ?container, "play audio");
-            state.audio.play_track(url.to_string(), container);
+            let audio_device = state.storage.audio_device().ok().flatten();
+            let exclusive = state.storage.exclusive_mode().unwrap_or(true);
+            info!(%url, container = ?container, ?audio_device, exclusive, "play audio");
+            state
+                .audio
+                .play_track(url.to_string(), container, audio_device, exclusive);
         }
         "MusicAlbum" | "Series" | "Season" | "Playlist" => {
             let Some(item) = current_items.iter().find(|i| i.id == item_id).cloned() else {
@@ -692,6 +777,91 @@ async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32,
     Ok(decoded)
 }
 
+// ---------------------------------------------------------------- audio settings
+
+/// Push whatever the storage already knows into the settings panel.
+/// Selected-id can point at a device we don't have in the cached
+/// list yet (we haven't called mpv) — that's fine, the dropdown
+/// shows the id-as-label until [`spawn_device_refresh`] resolves a
+/// real description.
+fn push_initial_audio_state(state: &AuthedState) {
+    let id = state.storage.audio_device().ok().flatten().unwrap_or_default();
+    let exclusive = state.storage.exclusive_mode().unwrap_or(true);
+    let label = if id.is_empty() {
+        "System default".to_string()
+    } else {
+        id.clone()
+    };
+    set_selected_audio_device(&state.weak, &id, &label);
+    set_exclusive_mode(&state.weak, exclusive);
+    set_devices_loading(&state.weak, true);
+}
+
+/// Enumerate audio outputs via mpv on a blocking thread, push the
+/// result to the UI, and (when `auto_pick` is true and storage has
+/// no preference yet) write the first bitperfect device back to
+/// storage. The first-launch auto-pick is the only thing that
+/// changes selection without explicit user input.
+fn spawn_device_refresh(state: &AuthedState, auto_pick: bool) {
+    let weak = state.weak.clone();
+    let cache = state.audio_devices.clone();
+    let storage = state.storage.clone();
+    set_devices_loading(&weak, true);
+    std::thread::spawn(move || {
+        let devices = match video_engine::list_audio_devices() {
+            Ok(d) => d,
+            Err(e) => {
+                error!(?e, "list_audio_devices failed");
+                set_devices_loading(&weak, false);
+                return;
+            }
+        };
+        {
+            let mut guard = cache.lock().unwrap();
+            *guard = devices.clone();
+        }
+
+        // Auto-pick on first launch only.
+        let mut selected_id = storage.audio_device().ok().flatten().unwrap_or_default();
+        if auto_pick && selected_id.is_empty()
+            && let Some(first) = devices.iter().find(|d| d.bitperfect)
+        {
+            if let Err(e) = storage.set_audio_device(Some(&first.id)) {
+                warn!(?e, "auto-pick persist failed");
+            } else {
+                info!(id = %first.id, desc = %first.description, "auto-picked bitperfect device");
+                selected_id = first.id.clone();
+            }
+        }
+
+        let label = if selected_id.is_empty() {
+            "System default".to_string()
+        } else {
+            devices
+                .iter()
+                .find(|d| d.id == selected_id)
+                .map(|d| d.description.clone())
+                .unwrap_or_else(|| selected_id.clone())
+        };
+
+        set_audio_devices(&weak, devices);
+        set_selected_audio_device(&weak, &selected_id, &label);
+        set_devices_loading(&weak, false);
+    });
+}
+
+fn resolve_device_label(state: &AuthedState, id: &str) -> String {
+    if id.is_empty() {
+        return "System default".to_string();
+    }
+    let guard = state.audio_devices.lock().unwrap();
+    guard
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.description.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
 // ---------------------------------------------------------------- mapping
 
 #[derive(Clone)]
@@ -943,6 +1113,53 @@ fn set_album_image(
         buffer.make_mut_bytes().copy_from_slice(&rgba);
         w.set_album_image(slint::Image::from_rgba8(buffer));
         w.set_album_has_image(true);
+    });
+}
+
+fn set_audio_devices(weak: &slint::Weak<MainWindow>, devices: Vec<AudioDevice>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            let slint_items: Vec<AudioDeviceItem> = devices
+                .into_iter()
+                .map(|d| AudioDeviceItem {
+                    id: SharedString::from(d.id),
+                    description: SharedString::from(d.description),
+                    bitperfect: d.bitperfect,
+                })
+                .collect();
+            w.set_audio_devices(ModelRc::new(VecModel::from(slint_items)));
+        }
+    });
+}
+
+fn set_selected_audio_device(weak: &slint::Weak<MainWindow>, id: &str, label: &str) {
+    let weak = weak.clone();
+    let id = SharedString::from(id);
+    let label = SharedString::from(label);
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_selected_audio_device(id);
+            w.set_selected_audio_device_label(label);
+        }
+    });
+}
+
+fn set_exclusive_mode(weak: &slint::Weak<MainWindow>, value: bool) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_exclusive_mode(value);
+        }
+    });
+}
+
+fn set_devices_loading(weak: &slint::Weak<MainWindow>, loading: bool) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_devices_loading(loading);
+        }
     });
 }
 

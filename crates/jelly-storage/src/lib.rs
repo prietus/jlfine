@@ -124,6 +124,36 @@ impl Storage {
         Ok(())
     }
 
+    /// Preferred audio output device, as an mpv-style id
+    /// (`coreaudio/<UID>`, `alsa/hw:1,0`, etc). `None` means the
+    /// caller should fall back to the platform default.
+    pub fn audio_device(&self) -> Result<Option<String>> {
+        let cfg = self.load_config()?;
+        Ok(cfg.audio_device.filter(|s| !s.is_empty()))
+    }
+
+    /// Persist or clear the preferred audio output device. Pass
+    /// `None` to fall back to the platform default.
+    pub fn set_audio_device(&self, device: Option<&str>) -> Result<()> {
+        let mut cfg = self.load_config()?;
+        cfg.audio_device = device.map(str::to_owned);
+        self.save_config(&cfg)
+    }
+
+    /// Whether music takes exclusive control of the output device.
+    /// Defaults to `true` (the v1 bitperfect requirement); the UI
+    /// settings screen lets the user flip it off.
+    pub fn exclusive_mode(&self) -> Result<bool> {
+        let cfg = self.load_config()?;
+        Ok(cfg.exclusive_mode.unwrap_or(true))
+    }
+
+    pub fn set_exclusive_mode(&self, exclusive: bool) -> Result<()> {
+        let mut cfg = self.load_config()?;
+        cfg.exclusive_mode = Some(exclusive);
+        self.save_config(&cfg)
+    }
+
     /// Drop the session fields from the config and delete the token from
     /// the keyring. Device ID is preserved.
     pub fn clear_session(&self) -> Result<()> {
@@ -179,6 +209,10 @@ struct ConfigFile {
     device_id: String,
     #[serde(default)]
     session: Option<SessionFields>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusive_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

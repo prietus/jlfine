@@ -11,3 +11,5 @@ publish.workspace = true
 libmpv2 = "6"
 thiserror.workspace = true
 tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true

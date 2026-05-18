@@ -13,6 +13,7 @@
 //! desktop app does not need that wrapper.
 
 use libmpv2::{Mpv, events::Event};
+use serde::Deserialize;
 use std::thread;
 use tracing::{debug, error, info, warn};
 
@@ -22,16 +23,76 @@ pub enum Error {
     Mpv(String),
 }
 
-/// Fire-and-forget playback. Returns immediately after spawning the
-/// worker thread; the mpv window stays open until the user closes it
-/// or EOF is reached.
-pub fn play(url: impl Into<String>) {
-    let url = url.into();
-    thread::spawn(move || run(url));
+/// One entry from mpv's `audio-device-list`. The `id` is the opaque
+/// string mpv expects back in its `audio-device` property; the
+/// `description` is the human-readable name. `bitperfect` flags
+/// outputs that bypass system mixers (CoreAudio with a specific UID
+/// on macOS, ALSA `hw:` direct on Linux); everything else routes
+/// through PulseAudio/Pipewire/JACK/dmix and may resample.
+#[derive(Debug, Clone)]
+pub struct AudioDevice {
+    pub id: String,
+    pub description: String,
+    pub bitperfect: bool,
 }
 
-fn run(url: String) {
-    info!(%url, "opening mpv window");
+/// Enumerate audio outputs visible to mpv. Spins up a short-lived
+/// mpv instance, queries `audio-device-list` (returned as JSON when
+/// read as a string), and drops the instance immediately. Cheap
+/// enough to call lazily from the UI when the user opens the
+/// settings screen.
+pub fn list_audio_devices() -> Result<Vec<AudioDevice>, Error> {
+    let mpv = Mpv::new().map_err(|e| Error::Mpv(format!("init: {e}")))?;
+    let json: String = mpv
+        .get_property("audio-device-list")
+        .map_err(|e| Error::Mpv(format!("get audio-device-list: {e}")))?;
+
+    #[derive(Deserialize)]
+    struct Raw {
+        name: String,
+        description: String,
+    }
+    let raw: Vec<Raw> = serde_json::from_str(&json)
+        .map_err(|e| Error::Mpv(format!("parse audio-device-list: {e}")))?;
+
+    let mut out: Vec<AudioDevice> = raw
+        .into_iter()
+        .map(|d| AudioDevice {
+            bitperfect: is_bitperfect(&d.name),
+            id: d.name,
+            description: d.description,
+        })
+        .collect();
+    // Bitperfect-capable devices first so first-launch defaults land
+    // on something useful; preserves mpv's order within each group.
+    out.sort_by_key(|d| !d.bitperfect);
+    Ok(out)
+}
+
+/// A device id is bitperfect when it identifies a specific hardware
+/// interface: `coreaudio/<UID>` (macOS, a concrete device, not the
+/// generic `coreaudio/` follow-system-default) or `alsa/hw:CARD,DEV`
+/// (Linux raw hardware). Everything else — Pulse, Pipewire, JACK,
+/// `alsa/default`, `alsa/plughw:*` — passes through a mixer.
+fn is_bitperfect(id: &str) -> bool {
+    if let Some(uid) = id.strip_prefix("coreaudio/") {
+        !uid.is_empty()
+    } else {
+        id.starts_with("alsa/hw:")
+    }
+}
+
+/// Fire-and-forget playback. Returns immediately after spawning the
+/// worker thread; the mpv window stays open until the user closes it
+/// or EOF is reached. `audio_device` is the mpv-style id from
+/// [`list_audio_devices`]; `None` lets mpv pick its default.
+pub fn play(url: impl Into<String>, audio_device: Option<String>) {
+    let url = url.into();
+    thread::spawn(move || run(url, audio_device));
+}
+
+fn run(url: String, audio_device: Option<String>) {
+    info!(%url, ?audio_device, "opening mpv window");
 
     let mpv = match Mpv::with_initializer(|init| {
         // terminal=yes ships mpv's own logs through our stderr. msg-level
@@ -52,6 +113,9 @@ fn run(url: String) {
         init.set_property("target-colorspace-hint", "yes")?;
         init.set_property("force-window", "yes")?;
         init.set_property("keep-open", "yes")?;
+        if let Some(dev) = audio_device.as_deref() {
+            init.set_property("audio-device", dev)?;
+        }
         Ok(())
     }) {
         Ok(m) => m,
