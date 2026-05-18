@@ -17,10 +17,11 @@
 #![allow(clippy::needless_return)]
 
 use anyhow::{Context, Result};
+use audio_engine::AudioEngine;
 use jelly_storage::Storage;
 use jellyfin_api::{
     BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
-    SortOrder, image_url, ticks_to_seconds, video_stream_url,
+    SortOrder, audio_stream_url, image_url, ticks_to_seconds, video_stream_url,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
@@ -220,6 +221,14 @@ impl ChildrenType {
             ChildrenType::PlaylistItems => "playlists",
         }
     }
+
+    /// "grid" of cards (default) vs. "tracklist" of rows for music.
+    fn display_mode(&self) -> &'static str {
+        match self {
+            ChildrenType::Tracks => "tracklist",
+            _ => "grid",
+        }
+    }
 }
 
 // ---------------------------------------------------------------- backend loop
@@ -316,6 +325,7 @@ struct AuthedState {
     epoch: Arc<AtomicU64>,
     image_http: reqwest::Client,
     image_sem: Arc<Semaphore>,
+    audio: AudioEngine,
 }
 
 impl AuthedState {
@@ -327,6 +337,7 @@ impl AuthedState {
             epoch: Arc::new(AtomicU64::new(0)),
             image_http: reqwest::Client::new(),
             image_sem: Arc::new(Semaphore::new(IMAGE_PARALLELISM)),
+            audio: AudioEngine::new(),
         }
     }
 }
@@ -414,7 +425,19 @@ async fn activate(
             video_engine::play(url.to_string());
         }
         "Audio" => {
-            info!(item = item_id, "audio playback not wired yet");
+            let Some(token) = state.client.token() else {
+                warn!("no token; cannot play");
+                return;
+            };
+            let container = current_items
+                .iter()
+                .find(|i| i.id == item_id)
+                .and_then(|i| i.media_sources.as_ref())
+                .and_then(|m| m.first())
+                .and_then(|s| s.container.clone());
+            let url = audio_stream_url(state.client.base_url(), item_id, token);
+            info!(%url, container = ?container, "play audio");
+            state.audio.play_track(url.to_string(), container);
         }
         "MusicAlbum" | "Series" | "Season" | "Playlist" => {
             let Some(item) = current_items.iter().find(|i| i.id == item_id).cloned() else {
@@ -428,6 +451,15 @@ async fn activate(
                 "Playlist" => ChildrenType::PlaylistItems,
                 _ => unreachable!(),
             };
+            let is_album = matches!(children, ChildrenType::Tracks);
+            let cover_tag = if is_album {
+                item.image_tags
+                    .as_ref()
+                    .and_then(|t| t.get("Primary"))
+                    .cloned()
+            } else {
+                None
+            };
             nav.push(NavEntry {
                 parent_id: item.id.clone(),
                 title: item.name.clone().unwrap_or_default(),
@@ -435,6 +467,11 @@ async fn activate(
                 children,
             });
             fetch_and_render(state, nav, current_items).await;
+            // Cover load uses the post-fetch epoch so a quick back-out
+            // cancels it cleanly via the epoch guard.
+            if let Some(tag) = cover_tag {
+                spawn_album_cover_fetch(state, item.id, tag);
+            }
         }
         other => {
             info!(item = item_id, kind = other, "activation not supported yet");
@@ -484,9 +521,15 @@ async fn fetch_and_render(
             top.subtitle.clone()
         },
         top.children.collection_label().into(),
+        top.children.display_mode().into(),
     );
     set_can_go_back(&state.weak, nav.len() > 1);
     set_items(&state.weak, vec![]);
+    // Cover only belongs to the album drill-down; clear it everywhere
+    // else. The cover load below (when entering an album) repopulates.
+    if !matches!(top.children, ChildrenType::Tracks) {
+        clear_album_image(&state.weak);
+    }
 
     let resp = match state
         .client
@@ -498,7 +541,13 @@ async fn fetch_and_render(
             error!(?e, "items fetch failed");
             if state.epoch.load(Ordering::SeqCst) == epoch {
                 set_loading(&state.weak, false);
-                set_view_meta(&state.weak, "Error".into(), format!("{e:#}"), String::new());
+                set_view_meta(
+                    &state.weak,
+                    "Error".into(),
+                    format!("{e:#}"),
+                    String::new(),
+                    "grid".into(),
+                );
             }
             return;
         }
@@ -527,6 +576,7 @@ async fn fetch_and_render(
         top.title.clone(),
         header_subtitle,
         top.children.collection_label().into(),
+        top.children.display_mode().into(),
     );
     set_items(&state.weak, items_data);
     set_loading(&state.weak, false);
@@ -585,6 +635,43 @@ async fn fetch_and_render(
     }
 }
 
+fn spawn_album_cover_fetch(state: &AuthedState, album_id: String, tag: String) {
+    let weak = state.weak.clone();
+    let http = state.image_http.clone();
+    let sem = state.image_sem.clone();
+    let epoch_ref = state.epoch.clone();
+    let expected_epoch = epoch_ref.load(Ordering::SeqCst);
+    let base = state.client.base_url().clone();
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if epoch_ref.load(Ordering::SeqCst) != expected_epoch {
+            return;
+        }
+        let url = image_url(
+            &base,
+            &album_id,
+            ApiImageType::Primary,
+            &ImageOptions {
+                tag: Some(tag),
+                fill_height: Some(600),
+                quality: Some(92),
+                ..Default::default()
+            },
+        );
+        match fetch_image(&http, &url).await {
+            Ok((rgba, w, h)) => {
+                if epoch_ref.load(Ordering::SeqCst) == expected_epoch {
+                    set_album_image(&weak, epoch_ref.clone(), expected_epoch, rgba, w, h);
+                }
+            }
+            Err(e) => debug!(?e, %url, "album cover fetch failed"),
+        }
+    });
+}
+
 async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32, u32)> {
     let bytes = http
         .get(url.as_str())
@@ -613,6 +700,7 @@ struct ItemData {
     title: String,
     subtitle: String,
     item_type: String,
+    track_index: i32,
 }
 
 /// Build the UI-side row for a Jellyfin item. Subtitle and visible
@@ -653,6 +741,7 @@ fn build_initial_item_data(item: &BaseItemDto) -> ItemData {
         title,
         subtitle,
         item_type,
+        track_index: item.index_number.unwrap_or(0),
     }
 }
 
@@ -760,6 +849,7 @@ fn set_view_meta(
     title: String,
     subtitle: String,
     collection_type: String,
+    view_mode: String,
 ) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -767,6 +857,7 @@ fn set_view_meta(
             w.set_view_title(SharedString::from(title));
             w.set_view_subtitle(SharedString::from(subtitle));
             w.set_view_collection_type(SharedString::from(collection_type));
+            w.set_view_mode(SharedString::from(view_mode));
         }
     });
 }
@@ -793,6 +884,7 @@ fn set_items(weak: &slint::Weak<MainWindow>, items: Vec<ItemData>) {
                     image: slint::Image::default(),
                     has_image: false,
                     item_type: SharedString::from(d.item_type),
+                    track_index: d.track_index,
                 })
                 .collect();
             w.set_items(ModelRc::new(VecModel::from(slint_items)));
@@ -828,6 +920,39 @@ fn push_item_image(
         item.image = slint::Image::from_rgba8(buffer);
         item.has_image = true;
         model.set_row_data(index, item);
+    });
+}
+
+fn set_album_image(
+    weak: &slint::Weak<MainWindow>,
+    epoch_ref: Arc<AtomicU64>,
+    expected_epoch: u64,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if epoch_ref.load(Ordering::SeqCst) != expected_epoch {
+            return;
+        }
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        let mut buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        w.set_album_image(slint::Image::from_rgba8(buffer));
+        w.set_album_has_image(true);
+    });
+}
+
+fn clear_album_image(weak: &slint::Weak<MainWindow>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_album_image(slint::Image::default());
+            w.set_album_has_image(false);
+        }
     });
 }
 

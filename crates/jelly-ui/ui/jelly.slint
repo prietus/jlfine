@@ -20,6 +20,7 @@ export struct Item {
     image: image,
     has-image: bool,
     item-type: string,
+    track-index: int,
 }
 
 export enum Screen { login, library }
@@ -258,6 +259,78 @@ component Card inherits Rectangle {
     }
 }
 
+component TrackRow inherits Rectangle {
+    in property <int> index;
+    in property <string> title;
+    in property <string> duration;
+    in property <bool> alt;
+    callback clicked();
+    height: 44px;
+    background: ta.has-hover
+        ? #ffffff10
+        : (root.alt ? #ffffff04 : transparent);
+    border-radius: 6px;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 14px;
+
+        // Index by default; play icon appears on hover. Both are
+        // absolute-positioned inside the same 32 px cell so swapping
+        // them doesn't shift the rest of the row.
+        Rectangle {
+            width: 32px;
+            Text {
+                x: 0;
+                y: 0;
+                width: 100%;
+                height: 100%;
+                text: root.index > 0 ? root.index : "";
+                visible: !ta.has-hover;
+                color: Theme.text-muted;
+                font-size: 13px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+            Text {
+                x: 0;
+                y: 0;
+                width: 100%;
+                height: 100%;
+                text: "▶";
+                visible: ta.has-hover;
+                color: Theme.accent;
+                font-size: 12px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: 14px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: root.duration;
+            color: Theme.text-muted;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            width: 64px;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 component LibraryScreen inherits Rectangle {
     in property <[ViewItem]> views;
     in property <string> user-name;
@@ -267,7 +340,10 @@ component LibraryScreen inherits Rectangle {
     in property <string> view-title;
     in property <string> view-subtitle;
     in property <string> view-collection-type;
+    in property <string> view-mode: "grid";
     in property <bool> can-go-back: false;
+    in property <image> album-image;
+    in property <bool> album-has-image: false;
     callback select-view(int, string, string);
     callback sign-out();
     callback activate-item(string, string);
@@ -395,21 +471,81 @@ component LibraryScreen inherits Rectangle {
                     }
                 }
 
-                // Grid of cards. We compute x/y manually so it wraps based
-                // on the available width without needing a flow layout
-                // primitive (Slint doesn't have one out of the box).
-                Flickable {
-                    property <int> cols: max(1, floor((self.width - 32px - 32px) / (180px + 20px)));
-                    property <int> rows: ceil(root.items.length / max(1, self.cols));
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, self.rows * (250px + 20px) + 32px);
+                // Body holds both views stacked; only one is visible
+                // at a time. We avoid `if` inside the surrounding layout
+                // because conditional layout children don't always
+                // re-react to property changes the way absolute-
+                // positioned children do.
+                Rectangle {
+                    vertical-stretch: 1;
 
-                    for it[i] in root.items: Card {
-                        x: 32px + mod(i, parent.cols) * (180px + 20px);
-                        y: 16px + floor(i / max(1, parent.cols)) * (250px + 20px);
-                        data: it;
-                        clicked => {
-                            root.activate-item(it.id, it.item-type);
+                    grid := Flickable {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        visible: root.view-mode != "tracklist";
+                        property <int> cols: max(1, floor((self.width - 32px - 32px) / (180px + 20px)));
+                        property <int> rows: ceil(root.items.length / max(1, self.cols));
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, self.rows * (250px + 20px) + 32px);
+
+                        for it[i] in root.items: Card {
+                            x: 32px + mod(i, parent.cols) * (180px + 20px);
+                            y: 16px + floor(i / max(1, parent.cols)) * (250px + 20px);
+                            data: it;
+                            clicked => {
+                                root.activate-item(it.id, it.item-type);
+                            }
+                        }
+                    }
+
+                    tracks := Flickable {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        visible: root.view-mode == "tracklist";
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, root.items.length * 48px + 232px);
+
+                        // Album cover sits at the top of the scrollable
+                        // area so it scrolls away when the user looks at
+                        // the lower tracks. Placeholder gradient while
+                        // the image streams in.
+                        Rectangle {
+                            x: 32px;
+                            y: 16px;
+                            width: 200px;
+                            height: 200px;
+                            border-radius: 10px;
+                            clip: true;
+                            background: #1a1d24;
+                            drop-shadow-color: #00000080;
+                            drop-shadow-blur: 24px;
+                            drop-shadow-offset-y: 6px;
+                            if !root.album-has-image: Rectangle {
+                                background: @linear-gradient(135deg, #1f2330 0%, #181b22 100%);
+                            }
+                            if root.album-has-image: Image {
+                                source: root.album-image;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: cover;
+                            }
+                        }
+
+                        for it[i] in root.items: TrackRow {
+                            x: 32px;
+                            y: 232px + i * 48px;
+                            width: parent.width - 64px;
+                            index: it.track-index > 0 ? it.track-index : i + 1;
+                            title: it.title;
+                            duration: it.subtitle;
+                            alt: mod(i, 2) == 1;
+                            clicked => {
+                                root.activate-item(it.id, it.item-type);
+                            }
                         }
                     }
                 }
@@ -440,7 +576,10 @@ export component MainWindow inherits Window {
     in property <string> view-title: "";
     in property <string> view-subtitle: "";
     in property <string> view-collection-type: "";
+    in property <string> view-mode: "grid";
     in property <bool> can-go-back: false;
+    in property <image> album-image;
+    in property <bool> album-has-image: false;
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
@@ -483,7 +622,10 @@ export component MainWindow inherits Window {
         view-title: root.view-title;
         view-subtitle: root.view-subtitle;
         view-collection-type: root.view-collection-type;
+        view-mode: root.view-mode;
         can-go-back: root.can-go-back;
+        album-image: root.album-image;
+        album-has-image: root.album-has-image;
         select-view(i, id, ct) => {
             root.selected-view = i;
             root.view-selected(id, ct);
