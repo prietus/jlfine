@@ -716,19 +716,24 @@ fn dop_format(pcm_rate: f64, channels: u32) -> AudioStreamBasicDescription {
     AudioStreamBasicDescription {
         mSampleRate: pcm_rate,
         mFormatID: kAudioFormatLinearPCM,
-        // 24-bit signed integer **packed** — 3 bytes per sample, no
-        // padding. This is what USB-Audio Class 2.0 declares for
-        // 24-bit endpoints, and it leaves no ambiguity about where
-        // the marker byte sits on the wire (offset 2 of each 3-byte
-        // sample, LE). AlignedHigh-in-32-bit looked superficially
-        // equivalent but CoreAudio re-shuffles bytes on the way to
-        // the USB stack and the DAC ended up reading the marker out
-        // of position — confirmed with the xDuoo XD-05 BAL which
-        // stayed in 176 kHz PCM mode rather than detecting DoP.
-        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-        mBytesPerPacket: 3 * channels,
+        // 24-bit AlignedHigh in a 32-bit container with NonMixable.
+        // Chosen from the DAC's advertised physical formats — the
+        // XD-05 BAL (and most USB-Audio Class DACs on macOS) doesn't
+        // expose 24-bit Packed (3-byte) at all; it only offers the
+        // 24-in-32-AlignedHigh variant, in Mixable and NonMixable
+        // flavours. Under HogMode we want NonMixable so the system
+        // never inserts conversion stages between us and the DAC.
+        // On the wire the 4-byte sample is [pad, dsd_lo, dsd_hi,
+        // marker] (LE memory order), which a DAC reading 24-bit
+        // AlignedHigh reconstructs as (marker<<16)|(dsd_hi<<8)|dsd_lo
+        // — marker lands on bits 23..16 where ESS Sabre / AKM DoP
+        // detectors look.
+        mFormatFlags: kAudioFormatFlagIsSignedInteger
+            | kAudioFormatFlagIsAlignedHigh
+            | kAudioFormatFlagIsNonMixable,
+        mBytesPerPacket: 4 * channels,
         mFramesPerPacket: 1,
-        mBytesPerFrame: 3 * channels,
+        mBytesPerFrame: 4 * channels,
         mChannelsPerFrame: channels,
         mBitsPerChannel: 24,
         mReserved: 0,
@@ -787,7 +792,7 @@ unsafe extern "C" fn dop_io_proc(
     }
 
     let channels = state.channels as usize;
-    let bytes_per_frame = 3 * channels;
+    let bytes_per_frame = 4 * channels;
     let frames = bytes / bytes_per_frame;
     let out = unsafe { std::slice::from_raw_parts_mut(data, frames * bytes_per_frame) };
 
@@ -852,26 +857,29 @@ fn write_dop_frame(out: &mut [u8], samples: &[u32], marker: u8) {
     // `samples` is one ring-buffer u32 per channel. Bits 15..0 are
     // the 16 DSD bits; bits 23..16 (the producer's marker) get
     // overwritten with the consumer's schedule. Output is 24-bit
-    // packed LE: 3 bytes per channel in [dsd_lo, dsd_hi, marker]
-    // order. USB-Audio Class transmits these 3 bytes in order, so
-    // the DAC sees `marker` at the high byte of the 24-bit sample.
+    // AlignedHigh in a 32-bit slot, native (LE) endian: 4 bytes
+    // per channel = [pad, dsd_lo, dsd_hi, marker]. The DAC reads
+    // the high 3 bytes as the 24-bit sample, putting `marker` on
+    // bits 23..16 where its DoP detector looks.
     for (ch, s) in samples.iter().enumerate() {
         let dsd_lo = (s & 0xFF) as u8;
         let dsd_hi = ((s >> 8) & 0xFF) as u8;
-        let base = ch * 3;
-        out[base] = dsd_lo;
-        out[base + 1] = dsd_hi;
-        out[base + 2] = marker;
+        let base = ch * 4;
+        out[base] = 0;
+        out[base + 1] = dsd_lo;
+        out[base + 2] = dsd_hi;
+        out[base + 3] = marker;
     }
 }
 
 #[inline]
 fn write_dop_silence_frame(out: &mut [u8], channels: usize, marker: u8, hi: u8, lo: u8) {
     for ch in 0..channels {
-        let base = ch * 3;
-        out[base] = lo;
-        out[base + 1] = hi;
-        out[base + 2] = marker;
+        let base = ch * 4;
+        out[base] = 0;
+        out[base + 1] = lo;
+        out[base + 2] = hi;
+        out[base + 3] = marker;
     }
 }
 
