@@ -655,34 +655,39 @@ pub fn play_stream_dop(
     }
 
     let prev = get_physical_format(stream_id)?;
-    set_physical_format(stream_id, &target)?;
-    session.saved_format = Some((stream_id, prev));
-    // Read back the format to confirm CoreAudio actually applied
-    // it. Some drivers return success from set but silently keep
-    // the previous format; that's a fast way to chase a phantom bug.
-    let actual = get_physical_format(stream_id).ok();
-    tracing::info!(
-        stream_id,
-        target_rate = target.mSampleRate,
-        target_bits = target.mBitsPerChannel,
-        target_flags = target.mFormatFlags,
-        target_bytes_per_frame = target.mBytesPerFrame,
-        actual_rate = actual.map(|f| f.mSampleRate),
-        actual_bits = actual.map(|f| f.mBitsPerChannel),
-        actual_flags = actual.map(|f| f.mFormatFlags),
-        actual_bytes_per_frame = actual.map(|f| f.mBytesPerFrame),
-        "physical format set for DoP"
-    );
+    if asbd_matches_target(&prev, &target) {
+        // Already in the right format (e.g. previous track was also
+        // DSD64). Skip the set entirely so the DAC doesn't show any
+        // intermediate rate flicker between tracks.
+        tracing::info!(stream_id, "physical format already DoP — skipping set");
+    } else {
+        set_physical_format(stream_id, &target)?;
+        session.saved_format = Some((stream_id, prev));
+        let actual = get_physical_format(stream_id).ok();
+        tracing::info!(
+            stream_id,
+            target_rate = target.mSampleRate,
+            target_bits = target.mBitsPerChannel,
+            target_flags = target.mFormatFlags,
+            target_bytes_per_frame = target.mBytesPerFrame,
+            actual_rate = actual.map(|f| f.mSampleRate),
+            actual_bits = actual.map(|f| f.mBitsPerChannel),
+            actual_flags = actual.map(|f| f.mFormatFlags),
+            actual_bytes_per_frame = actual.map(|f| f.mBytesPerFrame),
+            "physical format set for DoP"
+        );
+    }
 
-    // Aligning the device's nominal rate doesn't strictly matter
-    // after the physical format change, but some drivers expose
-    // confusing virtual formats unless the rate is right too.
-    let _ = set_nominal_sample_rate(device_id, pcm_rate);
+    // No `set_nominal_sample_rate` here: setting the physical format
+    // already establishes the wire rate, and a second call would
+    // make the DAC briefly re-lock (visible as "176.4 kHz PCM"
+    // showing on the display before DSD64 takes over).
 
-    // PLL lock for the new rate. The IOProc will emit DoP silence
-    // for any unfilled frames once it starts; we don't want a real
-    // first packet of audio to land while the DAC is still relocking.
-    thread::sleep(Duration::from_millis(500));
+    // Short PLL lock window. Long enough that the DAC has finished
+    // re-locking by the time the first DoP packet arrives; short
+    // enough that the user doesn't notice the gap between hitting
+    // play and audio starting.
+    thread::sleep(Duration::from_millis(200));
 
     let state = Box::new(DopPlayerState {
         consumer,
@@ -969,7 +974,7 @@ fn log_available_physical_formats(stream_id: AudioStreamID) {
         return;
     }
     for d in &buf {
-        tracing::info!(
+        tracing::debug!(
             stream_id,
             min_rate = d.mSampleRateRange.mMinimum,
             max_rate = d.mSampleRateRange.mMaximum,
@@ -1014,6 +1019,21 @@ fn physical_format_supported(
         return Err(HalError::EnumeratePhysicalFormats(s));
     }
     Ok(buf.iter().any(|d| asbd_compatible(&d.mFormat, target, &d.mSampleRateRange)))
+}
+
+/// Strict match for "already at the DoP target" — every field that
+/// affects the wire layout must agree. Used to skip a redundant
+/// physical-format set between consecutive DSD tracks.
+fn asbd_matches_target(
+    current: &AudioStreamBasicDescription,
+    target: &AudioStreamBasicDescription,
+) -> bool {
+    current.mFormatID == target.mFormatID
+        && current.mFormatFlags == target.mFormatFlags
+        && current.mBitsPerChannel == target.mBitsPerChannel
+        && current.mBytesPerFrame == target.mBytesPerFrame
+        && current.mChannelsPerFrame == target.mChannelsPerFrame
+        && (current.mSampleRate - target.mSampleRate).abs() < 0.5
 }
 
 fn asbd_compatible(
