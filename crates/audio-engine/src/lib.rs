@@ -1,14 +1,17 @@
 //! Bitperfect audio playback engine.
 //!
 //! Streams audio from a URL (typically Jellyfin `static=true` lossless),
-//! decodes with `symphonia`, and pumps PCM through a SPSC ring buffer
-//! into the platform's bitperfect output (CoreAudio HAL HogMode on
-//! macOS; ALSA `hw:` planned for Linux). The decoder runs on its own
-//! thread at decode speed; the IOProc consumes the buffer in real time.
-//! See the `project-jelly-rs` memory for the requirements behind this
-//! design.
+//! decodes with `symphonia` (PCM containers) or with the in-crate DSF
+//! parser + DoP packer (DSD), and pumps the result through a SPSC
+//! ring buffer into the platform's bitperfect output (CoreAudio HAL
+//! HogMode on macOS; ALSA `hw:` on Linux). The decoder/packer runs on
+//! its own thread at decode speed; the IOProc / writei loop consumes
+//! the buffer in real time.
 //!
-//! v1 limitations: no gapless, no seek/pause, no DSD.
+//! DSD: DSF containers are repackaged as DoP on macOS, and as either
+//! native `DSD_U32_BE` (when the DAC advertises it) or DoP on Linux.
+//! v1 limitations: no gapless, no seek/pause, DFF not yet parsed,
+//! DSD256+ not yet validated.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -401,7 +404,92 @@ fn play_dsd_blocking(
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn play_dsd_blocking(
+    url: &str,
+    ext: &str,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    if ext != "dsf" {
+        return Err(Error::Backend(format!("unsupported DSD container: {ext}")));
+    }
+
+    tracing::info!(%url, "opening DSF stream");
+    let resp = reqwest::blocking::get(url)?.error_for_status()?;
+    let stream = HttpStream::new(resp);
+    let reader =
+        dsf::DsfReader::new(stream).map_err(|e| Error::Decode(format!("dsf header: {e}")))?;
+
+    let dsd_rate = reader.header().sampling_frequency;
+    let channels = reader.header().channels;
+
+    // Native DSD frames its 32 DSD bits per u32 into a single ALSA
+    // frame, so the ALSA rate is dsd_rate/32 (DSD64 -> 88_200).
+    // Probe the DAC; if it doesn't advertise DSDU32BE we fall back
+    // to DoP at the standard PCM rate (dsd_rate/16).
+    let native_alsa_rate = dsd_rate / 32;
+    let native = linux::supports_dsd_native(audio_device, exclusive, native_alsa_rate, channels);
+    let pcm_rate = dop::DopPacker::pcm_sample_rate(dsd_rate);
+    tracing::info!(
+        dsd_rate,
+        channels,
+        native,
+        target_rate = if native { native_alsa_rate } else { pcm_rate },
+        "DSD route picked"
+    );
+
+    let alsa_rate = if native { native_alsa_rate } else { pcm_rate };
+    let capacity = (alsa_rate as usize) * (channels as usize) * 2;
+    let (producer, consumer) = rtrb::RingBuffer::<u32>::new(capacity);
+
+    let eof = Arc::new(AtomicBool::new(false));
+    let eof_dec = eof.clone();
+    let cancel_dec = cancel.clone();
+    let channels_usize = channels as usize;
+    let decoder_handle = thread::Builder::new()
+        .name(if native { "dsd-native-packer" } else { "dop-packer" }.into())
+        .spawn(move || {
+            let mut producer = producer;
+            if native {
+                pack_dsf_to_dsd_native(reader, channels_usize, &mut producer, &cancel_dec);
+            } else {
+                pack_dsf_to_dop(reader, channels_usize, &mut producer, &cancel_dec);
+            }
+            eof_dec.store(true, Ordering::Release);
+            tracing::info!("DSD packer finished");
+        })
+        .expect("spawn DSD packer thread");
+
+    let result = if native {
+        linux::play_stream_dsd_native(
+            consumer,
+            native_alsa_rate,
+            channels,
+            audio_device,
+            exclusive,
+            &cancel,
+            eof.clone(),
+        )
+    } else {
+        linux::play_stream_dop(
+            consumer,
+            pcm_rate,
+            channels,
+            audio_device,
+            exclusive,
+            &cancel,
+            eof.clone(),
+        )
+    };
+    cancel.store(true, Ordering::SeqCst);
+    let _ = decoder_handle.join();
+    result.map_err(|e| Error::Backend(format!("{e:?}")))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn play_dsd_blocking(
     _url: &str,
     _ext: &str,
@@ -412,6 +500,47 @@ fn play_dsd_blocking(
     Err(Error::Backend(
         "DSD playback not yet implemented on this platform".into(),
     ))
+}
+
+/// Linux-only: pack DSF into native `DSD_U32_BE` samples. Each ALSA
+/// frame carries 32 DSD bits per channel in MSB-first time order;
+/// the u32 we push must therefore have those bytes laid out in
+/// memory as [t0, t1, t2, t3] (oldest byte at the lowest address).
+/// On little-endian hosts that's `u32::from_le_bytes`.
+#[cfg(target_os = "linux")]
+fn pack_dsf_to_dsd_native<R: std::io::Read>(
+    mut reader: dsf::DsfReader<R>,
+    channels: usize,
+    producer: &mut rtrb::Producer<u32>,
+    cancel: &AtomicBool,
+) {
+    let mut byte_per_ch = vec![0u8; channels];
+    let mut frame_bytes: Vec<[u8; 4]> = vec![[0u8; 4]; channels];
+    let mut out = vec![0u32; channels];
+
+    'outer: loop {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        for slot in 0..4 {
+            match reader.next_byte_per_channel(&mut byte_per_ch) {
+                Ok(true) => {
+                    for ch in 0..channels {
+                        frame_bytes[ch][slot] = byte_per_ch[ch];
+                    }
+                }
+                Ok(false) => break 'outer,
+                Err(e) => {
+                    tracing::warn!(?e, "DSF read error, ending");
+                    return;
+                }
+            }
+        }
+        for ch in 0..channels {
+            out[ch] = u32::from_le_bytes(frame_bytes[ch]);
+        }
+        push_u32_all(producer, &out, cancel);
+    }
 }
 
 /// Pull DSD bytes from the DSF reader, hand pairs of bytes per

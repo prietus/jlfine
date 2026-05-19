@@ -34,6 +34,7 @@ pub enum AlsaError {
     HwParams(alsa::Error),
     Write(alsa::Error),
     UnsupportedFormat,
+    DopRequiresExclusive,
 }
 
 pub fn play_stream(
@@ -238,4 +239,207 @@ fn pick_format(pcm: &PCM, sample_rate: f64, channels: u32) -> Result<Format, als
     hwp.set_access(Access::RWInterleaved)?;
     hwp.set_format(Format::FloatLE)?;
     Ok(Format::FloatLE)
+}
+
+// ============================================================== DSD paths
+//
+// Two ALSA configurations, picked by the caller based on what the
+// hardware advertises:
+//
+// - **DSD native** (`DSDU32BE` at `dsd_rate/32`). The DAC eats DSD
+//   bits directly; nothing alters the bitstream. Maximum fidelity,
+//   restricted hardware support.
+// - **DoP** (`S32LE` at `dsd_rate/16`). 24-bit PCM with marker
+//   bytes; every DAC that accepts 24/176.4 works. Bit-identical to
+//   the source DSD bits — the DAC strips the marker and routes.
+//
+// Both share the same ring buffer element type (`u32`) but the
+// interpretation differs: native is "32 DSD bits MSB-first packed
+// LE-in-memory"; DoP is "24-bit AlignedHigh PCM sample packed
+// LE-in-memory with marker in bits 23..16".
+
+/// Probe whether the chosen ALSA device accepts native DSD playback
+/// at the given native frame rate. Opens, asks hw_params for
+/// `DSDU32BE` + rate + channels, then closes. Cheap and non-
+/// destructive — no playback occurs.
+pub fn supports_dsd_native(
+    audio_device: Option<&str>,
+    exclusive: bool,
+    alsa_rate: u32,
+    channels: u32,
+) -> bool {
+    let Ok(device_name) = resolve_device(audio_device, exclusive) else {
+        return false;
+    };
+    let Ok(pcm) = PCM::new(&device_name, Direction::Playback, false) else {
+        return false;
+    };
+    let Ok(hwp) = HwParams::any(&pcm) else {
+        return false;
+    };
+    if hwp.set_channels(channels).is_err() {
+        return false;
+    }
+    if hwp.set_rate(alsa_rate, ValueOr::Nearest).is_err() {
+        return false;
+    }
+    if hwp.set_access(Access::RWInterleaved).is_err() {
+        return false;
+    }
+    hwp.set_format(Format::DSDU32BE).is_ok()
+}
+
+pub fn play_stream_dop(
+    consumer: Consumer<u32>,
+    pcm_rate: u32,
+    channels: u32,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: &Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
+) -> Result<(), AlsaError> {
+    // DoP at the system mixer would be a lie — the mixer would treat
+    // the DoP bytes as garbage PCM. Refuse outright.
+    if !exclusive {
+        return Err(AlsaError::DopRequiresExclusive);
+    }
+    play_stream_dsd_generic(consumer, Format::S32LE, pcm_rate, channels, audio_device, exclusive, cancel, eof)
+}
+
+pub fn play_stream_dsd_native(
+    consumer: Consumer<u32>,
+    alsa_rate: u32,
+    channels: u32,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: &Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
+) -> Result<(), AlsaError> {
+    if !exclusive {
+        return Err(AlsaError::DopRequiresExclusive);
+    }
+    play_stream_dsd_generic(
+        consumer,
+        Format::DSDU32BE,
+        alsa_rate,
+        channels,
+        audio_device,
+        exclusive,
+        cancel,
+        eof,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_stream_dsd_generic(
+    mut consumer: Consumer<u32>,
+    format: Format,
+    rate: u32,
+    channels: u32,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: &Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
+) -> Result<(), AlsaError> {
+    let device_name = resolve_device(audio_device, exclusive)?;
+    tracing::info!(
+        device = %device_name,
+        format = ?format,
+        rate,
+        channels,
+        "opening ALSA PCM for DSD"
+    );
+    let pcm = PCM::new(&device_name, Direction::Playback, false).map_err(AlsaError::Open)?;
+
+    // The buffer geometry matches the PCM path. ~85 ms at the chosen
+    // rate is enough headroom for jittery HTTP without dragging
+    // start-of-track latency higher than the user would notice.
+    let buffer_frames: u32 = 4096;
+    let period_frames: u32 = 1024;
+    {
+        let hwp = HwParams::any(&pcm).map_err(AlsaError::HwParams)?;
+        hwp.set_channels(channels).map_err(AlsaError::HwParams)?;
+        hwp.set_rate(rate, ValueOr::Nearest).map_err(AlsaError::HwParams)?;
+        hwp.set_format(format).map_err(|_| AlsaError::UnsupportedFormat)?;
+        hwp.set_access(Access::RWInterleaved).map_err(AlsaError::HwParams)?;
+        hwp.set_buffer_size_near(buffer_frames as i64)
+            .map_err(AlsaError::HwParams)?;
+        hwp.set_period_size_near(period_frames as i64, ValueOr::Nearest)
+            .map_err(AlsaError::HwParams)?;
+        pcm.hw_params(&hwp).map_err(AlsaError::HwParams)?;
+    }
+
+    // Prefill ~200 ms so writei never runs the kernel ring dry on
+    // its very first call. Match the PCM path so behaviour is
+    // predictable.
+    {
+        let target = (rate as usize) * (channels as usize) / 5;
+        let start = Instant::now();
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if eof.load(Ordering::Acquire) {
+                break;
+            }
+            if consumer.slots() >= target {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                tracing::warn!(slots = consumer.slots(), "DSD prefill timeout");
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        tracing::info!(slots = consumer.slots(), "DSD prefill done");
+    }
+
+    pcm.prepare().map_err(AlsaError::Open)?;
+
+    let chunk_samples = (period_frames as usize) * (channels as usize);
+    let mut u32_buf: Vec<u32> = vec![0; chunk_samples];
+    // io_i32 + bit-equivalent cast is bytewise identical to io_u32
+    // and works on every alsa-rs version we care about. The kernel
+    // interprets the bytes per the format flag, not per the sign.
+    let io = pcm.io_i32().map_err(AlsaError::Write)?;
+
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
+        let avail = consumer.slots();
+        if avail == 0 {
+            if eof.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let take = avail.min(chunk_samples);
+        let chunk = match consumer.read_chunk(take) {
+            Ok(c) => c,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        };
+        let (s1, s2) = chunk.as_slices();
+        u32_buf[..s1.len()].copy_from_slice(s1);
+        u32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
+        chunk.commit_all();
+
+        let i32_slice = unsafe {
+            std::slice::from_raw_parts(u32_buf.as_ptr() as *const i32, take)
+        };
+        match io.writei(i32_slice) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(?e, "DSD writei error, attempting recover");
+                pcm.try_recover(e, true).map_err(AlsaError::Write)?;
+            }
+        }
+    }
+
+    let _ = pcm.drain();
+    Ok(())
 }
