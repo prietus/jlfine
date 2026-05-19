@@ -346,10 +346,62 @@ fn play_pcm_blocking(
     Err(Error::Unsupported)
 }
 
-/// DSD playback: read DSF over HTTP, repackage as DoP (mac) or
-/// native DSD-U32-BE with DoP fallback (linux). Backend wiring
-/// arrives in the next commits — this stub keeps the dispatcher
-/// honest and the build green.
+#[cfg(target_os = "macos")]
+fn play_dsd_blocking(
+    url: &str,
+    ext: &str,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    if ext != "dsf" {
+        return Err(Error::Backend(format!("unsupported DSD container: {ext}")));
+    }
+
+    tracing::info!(%url, "opening DSF stream");
+    let resp = reqwest::blocking::get(url)?.error_for_status()?;
+    let stream = HttpStream::new(resp);
+    let reader =
+        dsf::DsfReader::new(stream).map_err(|e| Error::Decode(format!("dsf header: {e}")))?;
+
+    let dsd_rate = reader.header().sampling_frequency;
+    let channels = reader.header().channels;
+    let pcm_rate = dop::DopPacker::pcm_sample_rate(dsd_rate);
+    tracing::info!(dsd_rate, pcm_rate, channels, "DSF -> DoP");
+
+    // 2 seconds of u32 DoP samples at the PCM rate.
+    let capacity = (pcm_rate as usize) * (channels as usize) * 2;
+    let (producer, consumer) = rtrb::RingBuffer::<u32>::new(capacity);
+
+    let eof = Arc::new(AtomicBool::new(false));
+    let eof_dec = eof.clone();
+    let cancel_dec = cancel.clone();
+    let decoder_handle = thread::Builder::new()
+        .name("dsd-packer".into())
+        .spawn(move || {
+            let mut producer = producer;
+            pack_dsf_to_dop(reader, channels as usize, &mut producer, &cancel_dec);
+            eof_dec.store(true, Ordering::Release);
+            tracing::info!("DSD packer finished");
+        })
+        .expect("spawn DSD packer thread");
+
+    let result = mac::play_stream_dop(
+        consumer,
+        pcm_rate as f64,
+        channels,
+        audio_device,
+        exclusive,
+        &cancel,
+        eof.clone(),
+    );
+    cancel.store(true, Ordering::SeqCst);
+    let _ = decoder_handle.join();
+    result.map_err(|e| Error::Backend(format!("{e:?}")))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn play_dsd_blocking(
     _url: &str,
     _ext: &str,
@@ -358,8 +410,90 @@ fn play_dsd_blocking(
     _cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     Err(Error::Backend(
-        "DSD playback not yet implemented (DoP backend pending)".into(),
+        "DSD playback not yet implemented on this platform".into(),
     ))
+}
+
+/// Pull DSD bytes from the DSF reader, hand pairs of bytes per
+/// channel to the DoP packer, push the resulting 24-bit-in-32-bit
+/// PCM samples into the ring buffer. Two DSD bytes per channel per
+/// PCM frame: that's where the DSD-rate / 16 PCM rate falls out.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pack_dsf_to_dop<R: std::io::Read>(
+    mut reader: dsf::DsfReader<R>,
+    channels: usize,
+    producer: &mut rtrb::Producer<u32>,
+    cancel: &AtomicBool,
+) {
+    let mut packer = dop::DopPacker::new(channels);
+    let mut dsd_pair = vec![0u8; channels * 2]; // [ch0_hi, ch0_lo, ch1_hi, ch1_lo, ...]
+    let mut byte_per_ch = vec![0u8; channels];
+    let mut out = vec![0u32; channels];
+
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        // Read 2 DSD bytes per channel: the older byte first, then
+        // the newer. EOF before completing the pair = end of stream.
+        match reader.next_byte_per_channel(&mut byte_per_ch) {
+            Ok(true) => {
+                for ch in 0..channels {
+                    dsd_pair[ch * 2] = byte_per_ch[ch];
+                }
+            }
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(?e, "DSF read error, ending");
+                return;
+            }
+        }
+        match reader.next_byte_per_channel(&mut byte_per_ch) {
+            Ok(true) => {
+                for ch in 0..channels {
+                    dsd_pair[ch * 2 + 1] = byte_per_ch[ch];
+                }
+            }
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(?e, "DSF read error, ending");
+                return;
+            }
+        }
+        packer.pack_frame(&dsd_pair, &mut out);
+        push_u32_all(producer, &out, cancel);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn push_u32_all(producer: &mut rtrb::Producer<u32>, mut samples: &[u32], cancel: &AtomicBool) {
+    use std::time::Duration;
+    while !samples.is_empty() {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        let avail = producer.slots();
+        if avail == 0 {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let n = avail.min(samples.len());
+        match producer.write_chunk_uninit(n) {
+            Ok(mut chunk) => {
+                let (s1, s2) = chunk.as_mut_slices();
+                let (a, b) = samples[..n].split_at(s1.len());
+                for (slot, val) in s1.iter_mut().zip(a) {
+                    slot.write(*val);
+                }
+                for (slot, val) in s2.iter_mut().zip(b) {
+                    slot.write(*val);
+                }
+                unsafe { chunk.commit_all() };
+                samples = &samples[n..];
+            }
+            Err(_) => thread::sleep(Duration::from_millis(2)),
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

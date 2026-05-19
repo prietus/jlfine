@@ -40,10 +40,6 @@ impl DopPacker {
         }
     }
 
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
     /// Resulting 24-bit-in-32-bit PCM sample rate for the given DSD
     /// rate (in DSD bits per second per channel).
     pub fn pcm_sample_rate(dsd_rate: u32) -> u32 {
@@ -151,9 +147,4 @@ mod tests {
         assert_eq!(DopPacker::pcm_sample_rate(5_644_800), 352_800);
     }
 
-    #[test]
-    fn channels_count_matches_constructor() {
-        let p = DopPacker::new(6);
-        assert_eq!(p.channels(), 6);
-    }
 }
