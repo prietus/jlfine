@@ -145,8 +145,26 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn play_blocking(
+    url: &str,
+    container: Option<&str>,
+    audio_device: Option<&str>,
+    exclusive: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    let ext = container.unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        // DSD goes through a separate decode path: symphonia doesn't
+        // decode DSD, and the backend has to negotiate either DoP
+        // (24-bit PCM with marker bytes) or a native DSD format on
+        // Linux. PCM/lossless containers all flow through symphonia.
+        "dsf" | "dff" => play_dsd_blocking(url, &ext, audio_device, exclusive, cancel),
+        _ => play_pcm_blocking(url, container, audio_device, exclusive, cancel),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn play_pcm_blocking(
     url: &str,
     container: Option<&str>,
     audio_device: Option<&str>,
@@ -234,7 +252,7 @@ fn play_blocking(
 }
 
 #[cfg(target_os = "linux")]
-fn play_blocking(
+fn play_pcm_blocking(
     url: &str,
     container: Option<&str>,
     audio_device: Option<&str>,
@@ -318,7 +336,7 @@ fn play_blocking(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn play_blocking(
+fn play_pcm_blocking(
     _url: &str,
     _container: Option<&str>,
     _audio_device: Option<&str>,
@@ -326,6 +344,22 @@ fn play_blocking(
     _cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     Err(Error::Unsupported)
+}
+
+/// DSD playback: read DSF over HTTP, repackage as DoP (mac) or
+/// native DSD-U32-BE with DoP fallback (linux). Backend wiring
+/// arrives in the next commits — this stub keeps the dispatcher
+/// honest and the build green.
+fn play_dsd_blocking(
+    _url: &str,
+    _ext: &str,
+    _audio_device: Option<&str>,
+    _exclusive: bool,
+    _cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    Err(Error::Backend(
+        "DSD playback not yet implemented (DoP backend pending)".into(),
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
