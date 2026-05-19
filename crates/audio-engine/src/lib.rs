@@ -104,8 +104,26 @@ impl Default for AudioEngine {
 fn worker(rx: mpsc::Receiver<Cmd>) {
     let mut current_cancel: Option<Arc<AtomicBool>> = None;
     let mut current_handle: Option<JoinHandle<()>> = None;
+    let mut current_skip_restore: Option<Arc<AtomicBool>> = None;
+    let mut current_was_dsd = false;
 
     while let Ok(cmd) = rx.recv() {
+        // If the current playback is DSD and the next one is also
+        // DSD, signal the current Session to skip the
+        // physical-format restore on drop. The next Session will
+        // either keep the format as-is (saving a DAC re-lock) or
+        // overwrite it explicitly for a different DSD rate.
+        let next_is_dsd = matches!(
+            &cmd,
+            Cmd::Play { container, .. }
+                if matches!(container.as_deref(), Some("dsf") | Some("dff"))
+        );
+        if current_was_dsd && next_is_dsd
+            && let Some(s) = &current_skip_restore
+        {
+            s.store(true, Ordering::SeqCst);
+        }
+
         // Stop the previous playback FIRST so HogMode is released
         // before the new acquire attempt. Joining here is essential —
         // otherwise the new thread might race the old one for the
@@ -116,6 +134,8 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
         if let Some(h) = current_handle.take() {
             let _ = h.join();
         }
+        current_skip_restore = None;
+        current_was_dsd = false;
 
         match cmd {
             Cmd::Stop => continue,
@@ -127,6 +147,8 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
             } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 let cancel_clone = cancel.clone();
+                let skip_restore = Arc::new(AtomicBool::new(false));
+                let skip_restore_clone = skip_restore.clone();
                 let handle = thread::Builder::new()
                     .name("audio-playback".into())
                     .spawn(move || {
@@ -136,6 +158,7 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                             audio_device.as_deref(),
                             exclusive,
                             cancel_clone,
+                            skip_restore_clone,
                         ) {
                             tracing::error!(?e, "audio playback failed");
                         }
@@ -143,6 +166,8 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                     .expect("spawn playback thread");
                 current_cancel = Some(cancel);
                 current_handle = Some(handle);
+                current_skip_restore = Some(skip_restore);
+                current_was_dsd = next_is_dsd;
             }
         }
     }
@@ -154,6 +179,7 @@ fn play_blocking(
     audio_device: Option<&str>,
     exclusive: bool,
     cancel: Arc<AtomicBool>,
+    skip_restore: Arc<AtomicBool>,
 ) -> Result<()> {
     let ext = container.unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
@@ -161,7 +187,9 @@ fn play_blocking(
         // decode DSD, and the backend has to negotiate either DoP
         // (24-bit PCM with marker bytes) or a native DSD format on
         // Linux. PCM/lossless containers all flow through symphonia.
-        "dsf" | "dff" => play_dsd_blocking(url, &ext, audio_device, exclusive, cancel),
+        "dsf" | "dff" => play_dsd_blocking(url, &ext, audio_device, exclusive, cancel, skip_restore),
+        // PCM path doesn't touch the physical format, so there's
+        // nothing to skip restoring — the parameter is dropped.
         _ => play_pcm_blocking(url, container, audio_device, exclusive, cancel),
     }
 }
@@ -356,6 +384,7 @@ fn play_dsd_blocking(
     audio_device: Option<&str>,
     exclusive: bool,
     cancel: Arc<AtomicBool>,
+    skip_restore: Arc<AtomicBool>,
 ) -> Result<()> {
     if ext != "dsf" {
         return Err(Error::Backend(format!("unsupported DSD container: {ext}")));
@@ -397,6 +426,7 @@ fn play_dsd_blocking(
         exclusive,
         &cancel,
         eof.clone(),
+        skip_restore,
     );
     cancel.store(true, Ordering::SeqCst);
     let _ = decoder_handle.join();
@@ -411,6 +441,7 @@ fn play_dsd_blocking(
     audio_device: Option<&str>,
     exclusive: bool,
     cancel: Arc<AtomicBool>,
+    _skip_restore: Arc<AtomicBool>,
 ) -> Result<()> {
     if ext != "dsf" {
         return Err(Error::Backend(format!("unsupported DSD container: {ext}")));
@@ -496,6 +527,7 @@ fn play_dsd_blocking(
     _audio_device: Option<&str>,
     _exclusive: bool,
     _cancel: Arc<AtomicBool>,
+    _skip_restore: Arc<AtomicBool>,
 ) -> Result<()> {
     Err(Error::Backend(
         "DSD playback not yet implemented on this platform".into(),

@@ -573,6 +573,10 @@ struct DopSession {
     /// restore in Drop so the user doesn't reboot to get their DAC
     /// back into Float32.
     saved_format: Option<(AudioStreamID, AudioStreamBasicDescription)>,
+    /// Set by the worker when the next queued play is also DSD —
+    /// restoring the physical format only to overwrite it again
+    /// makes the DAC's display flash through the previous rate.
+    skip_restore: Arc<AtomicBool>,
 }
 
 impl Drop for DopSession {
@@ -585,7 +589,14 @@ impl Drop for DopSession {
                 AudioDeviceDestroyIOProcID(self.device_id, self.proc_id);
             }
             if let Some((stream_id, prev)) = self.saved_format.take() {
-                let _ = set_physical_format(stream_id, &prev);
+                if self.skip_restore.load(Ordering::SeqCst) {
+                    tracing::info!(
+                        stream_id,
+                        "skipping physical-format restore (next play is also DSD)"
+                    );
+                } else {
+                    let _ = set_physical_format(stream_id, &prev);
+                }
             }
             if self.took_hog {
                 let _ = release_hog_mode(self.device_id);
@@ -597,6 +608,7 @@ impl Drop for DopSession {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn play_stream_dop(
     consumer: Consumer<u32>,
     pcm_rate: f64,
@@ -605,6 +617,7 @@ pub fn play_stream_dop(
     exclusive: bool,
     cancel: &Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
+    skip_restore: Arc<AtomicBool>,
 ) -> Result<(), HalError> {
     if !exclusive {
         // No HogMode = no physical-format change. Refuse rather than
@@ -629,6 +642,7 @@ pub fn play_stream_dop(
         running: false,
         state_ptr: ptr::null_mut(),
         saved_format: None,
+        skip_restore,
     };
 
     session.took_hog = acquire_hog_mode(device_id)?;
