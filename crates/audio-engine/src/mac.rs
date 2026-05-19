@@ -640,6 +640,8 @@ pub fn play_stream_dop(
     let stream_id = first_output_stream(device_id)?;
     let target = dop_format(pcm_rate, channels);
 
+    log_available_physical_formats(stream_id);
+
     // Bail out early with a clean error rather than poke the device
     // and hope.
     if !physical_format_supported(stream_id, &target)? {
@@ -647,7 +649,7 @@ pub fn play_stream_dop(
             stream_id,
             sample_rate = target.mSampleRate,
             bits = target.mBitsPerChannel,
-            "device does not advertise 24-bit BE integer at the DoP rate"
+            "device does not advertise 24-bit packed integer at the DoP rate"
         );
         return Err(HalError::PhysicalFormatUnsupported);
     }
@@ -655,10 +657,21 @@ pub fn play_stream_dop(
     let prev = get_physical_format(stream_id)?;
     set_physical_format(stream_id, &target)?;
     session.saved_format = Some((stream_id, prev));
+    // Read back the format to confirm CoreAudio actually applied
+    // it. Some drivers return success from set but silently keep
+    // the previous format; that's a fast way to chase a phantom bug.
+    let actual = get_physical_format(stream_id).ok();
     tracing::info!(
         stream_id,
-        sample_rate = target.mSampleRate,
-        "physical format switched to 24/32 BE int for DoP"
+        target_rate = target.mSampleRate,
+        target_bits = target.mBitsPerChannel,
+        target_flags = target.mFormatFlags,
+        target_bytes_per_frame = target.mBytesPerFrame,
+        actual_rate = actual.map(|f| f.mSampleRate),
+        actual_bits = actual.map(|f| f.mBitsPerChannel),
+        actual_flags = actual.map(|f| f.mFormatFlags),
+        actual_bytes_per_frame = actual.map(|f| f.mBytesPerFrame),
+        "physical format set for DoP"
     );
 
     // Aligning the device's nominal rate doesn't strictly matter
@@ -703,18 +716,19 @@ fn dop_format(pcm_rate: f64, channels: u32) -> AudioStreamBasicDescription {
     AudioStreamBasicDescription {
         mSampleRate: pcm_rate,
         mFormatID: kAudioFormatLinearPCM,
-        // Signed, 24-bit AlignedHigh in a 32-bit container, native
-        // endian (LE on Apple Silicon). USB-Audio Class drivers
-        // almost always expose physical formats as native-endian;
-        // BigEndian is the path of least compatibility. The DoP
-        // marker still ends up as the most-significant byte of the
-        // 24-bit *sample*, which is what the DAC inspects — that's
-        // independent of memory byte order as long as we write
-        // bytes consistent with the declared format.
-        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsAlignedHigh,
-        mBytesPerPacket: 4 * channels,
+        // 24-bit signed integer **packed** — 3 bytes per sample, no
+        // padding. This is what USB-Audio Class 2.0 declares for
+        // 24-bit endpoints, and it leaves no ambiguity about where
+        // the marker byte sits on the wire (offset 2 of each 3-byte
+        // sample, LE). AlignedHigh-in-32-bit looked superficially
+        // equivalent but CoreAudio re-shuffles bytes on the way to
+        // the USB stack and the DAC ended up reading the marker out
+        // of position — confirmed with the xDuoo XD-05 BAL which
+        // stayed in 176 kHz PCM mode rather than detecting DoP.
+        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        mBytesPerPacket: 3 * channels,
         mFramesPerPacket: 1,
-        mBytesPerFrame: 4 * channels,
+        mBytesPerFrame: 3 * channels,
         mChannelsPerFrame: channels,
         mBitsPerChannel: 24,
         mReserved: 0,
@@ -744,9 +758,9 @@ fn create_io_proc_with_callback(
 
 /// DoP IOProc.
 ///
-/// Layout in `out`: 32-bit big-endian per channel, 24-bit useful in
-/// the high 3 bytes ([marker, dsd_hi, dsd_lo, 0]) — we write the
-/// `to_be_bytes()` of `value << 8` so the wire sees marker first.
+/// Layout in `out`: 24-bit packed per channel, 3 bytes per sample,
+/// no padding. Memory order matches USB-Audio Class wire order:
+/// `[dsd_lo, dsd_hi, marker]` per channel, repeated across frames.
 ///
 /// The marker comes from the consumer's own counter; whatever the
 /// producer encoded in bits 23..16 of each ring-buffer u32 is
@@ -773,7 +787,7 @@ unsafe extern "C" fn dop_io_proc(
     }
 
     let channels = state.channels as usize;
-    let bytes_per_frame = 4 * channels;
+    let bytes_per_frame = 3 * channels;
     let frames = bytes / bytes_per_frame;
     let out = unsafe { std::slice::from_raw_parts_mut(data, frames * bytes_per_frame) };
 
@@ -784,7 +798,7 @@ unsafe extern "C" fn dop_io_proc(
     let mut marker = state.next_marker.load(Ordering::Relaxed);
 
     // Real samples: pull from ring, strip whatever marker the producer put
-    // in bits 23..16, restamp with `marker`, emit as 24-bit BE in 32-bit.
+    // in bits 23..16, restamp with `marker`, emit as 24-bit packed LE.
     if take_frames > 0 {
         if let Ok(chunk) = state.consumer.read_chunk(take_frames * channels) {
             let (s1, s2) = chunk.as_slices();
@@ -837,26 +851,27 @@ fn flip_marker(m: u8) -> u8 {
 fn write_dop_frame(out: &mut [u8], samples: &[u32], marker: u8) {
     // `samples` is one ring-buffer u32 per channel. Bits 15..0 are
     // the 16 DSD bits; bits 23..16 (the producer's marker) get
-    // overwritten with the consumer's schedule. Output bytes are
-    // native-endian AlignedHigh: LE memory order so the byte the
-    // USB stack transmits last (= the high byte of the 24-bit
-    // sample = the marker) ends up at offset 3.
+    // overwritten with the consumer's schedule. Output is 24-bit
+    // packed LE: 3 bytes per channel in [dsd_lo, dsd_hi, marker]
+    // order. USB-Audio Class transmits these 3 bytes in order, so
+    // the DAC sees `marker` at the high byte of the 24-bit sample.
     for (ch, s) in samples.iter().enumerate() {
-        let dsd = s & 0xFFFF;
-        let pcm24_aligned_high = (((marker as u32) << 16) | dsd) << 8;
-        let bytes = pcm24_aligned_high.to_le_bytes();
-        let base = ch * 4;
-        out[base..base + 4].copy_from_slice(&bytes);
+        let dsd_lo = (s & 0xFF) as u8;
+        let dsd_hi = ((s >> 8) & 0xFF) as u8;
+        let base = ch * 3;
+        out[base] = dsd_lo;
+        out[base + 1] = dsd_hi;
+        out[base + 2] = marker;
     }
 }
 
 #[inline]
 fn write_dop_silence_frame(out: &mut [u8], channels: usize, marker: u8, hi: u8, lo: u8) {
-    let pcm24 = ((marker as u32) << 16) | ((hi as u32) << 8) | (lo as u32);
-    let bytes = (pcm24 << 8).to_le_bytes();
     for ch in 0..channels {
-        let base = ch * 4;
-        out[base..base + 4].copy_from_slice(&bytes);
+        let base = ch * 3;
+        out[base] = lo;
+        out[base + 1] = hi;
+        out[base + 2] = marker;
     }
 }
 
@@ -914,6 +929,50 @@ fn first_output_stream(device_id: AudioObjectID) -> Result<AudioStreamID, HalErr
         return Err(HalError::EnumerateStreams(s));
     }
     Ok(ids[0])
+}
+
+/// Emit one log line per advertised physical format on a stream.
+/// Pure debug aid for narrowing down "device refused our format"
+/// scenarios — easy to compare against `target` in the next log line.
+fn log_available_physical_formats(stream_id: AudioStreamID) {
+    let addr = available_physical_formats_property();
+    let mut size: u32 = 0;
+    let s = unsafe {
+        AudioObjectGetPropertyDataSize(stream_id, &addr, 0, ptr::null(), &mut size)
+    };
+    if s != 0 || size == 0 {
+        tracing::debug!(stream_id, status = s, "no available physical formats");
+        return;
+    }
+    let count = size as usize / mem::size_of::<AudioStreamRangedDescription>();
+    let mut buf = vec![AudioStreamRangedDescription::default(); count];
+    let s = unsafe {
+        AudioObjectGetPropertyData(
+            stream_id,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            buf.as_mut_ptr() as *mut c_void,
+        )
+    };
+    if s != 0 {
+        tracing::debug!(stream_id, status = s, "failed to read available formats");
+        return;
+    }
+    for d in &buf {
+        tracing::info!(
+            stream_id,
+            min_rate = d.mSampleRateRange.mMinimum,
+            max_rate = d.mSampleRateRange.mMaximum,
+            rate = d.mFormat.mSampleRate,
+            bits = d.mFormat.mBitsPerChannel,
+            flags = d.mFormat.mFormatFlags,
+            bytes_per_frame = d.mFormat.mBytesPerFrame,
+            channels = d.mFormat.mChannelsPerFrame,
+            "available physical format"
+        );
+    }
 }
 
 fn physical_format_supported(
