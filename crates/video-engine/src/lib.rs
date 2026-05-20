@@ -20,6 +20,8 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+mod mac_gl;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
