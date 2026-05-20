@@ -14,6 +14,7 @@
 
 use libmpv2::{Mpv, events::Event};
 use serde::Deserialize;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::thread;
 use tracing::{debug, error, info, warn};
@@ -152,12 +153,50 @@ pub fn play(url: impl Into<String>, audio_device: Option<String>) {
                     return;
                 }
             };
+            install_default_keybindings(&mpv);
             if let Err(e) = mpv.command("loadfile", &[&url]) {
                 error!(?e, "loadfile failed");
                 return;
             }
             pump_mpv_events(&mpv);
         });
+    }
+}
+
+/// Register the standard mpv keys at runtime. Belt and braces around
+/// the `input-default-bindings` / `input-builtin-bindings` toggle —
+/// on some libmpv builds neither flag actually loads the bundled
+/// input.conf, so the user sees `[input] No key binding found for
+/// key 'f'.` and nothing happens. Calling `keybind` explicitly
+/// guarantees the bindings exist whatever the build's behaviour.
+fn install_default_keybindings(mpv: &Mpv) {
+    // (key, command) pairs. Same mapping as the macOS NSEvent
+    // monitor — pause/seek/mute/fullscreen/stats/audio/sub cycle/
+    // quit. Mouse: left-click pauses, double-click toggles
+    // fullscreen, scroll seeks (which mpv handles via WHEEL_UP/DOWN).
+    let bindings: &[(&str, &str)] = &[
+        ("SPACE", "cycle pause"),
+        ("LEFT", "seek -5"),
+        ("RIGHT", "seek 5"),
+        ("UP", "seek 60"),
+        ("DOWN", "seek -60"),
+        ("f", "cycle fullscreen"),
+        ("m", "cycle mute"),
+        ("a", "cycle audio"),
+        ("s", "cycle sub"),
+        ("i", "script-binding stats/display-stats"),
+        ("I", "script-binding stats/display-stats-toggle"),
+        ("q", "quit"),
+        ("ESC", "quit"),
+        ("MBTN_LEFT", "cycle pause"),
+        ("MBTN_LEFT_DBL", "cycle fullscreen"),
+        ("WHEEL_UP", "seek 5"),
+        ("WHEEL_DOWN", "seek -5"),
+    ];
+    for (key, cmd) in bindings {
+        if let Err(e) = mpv.command("keybind", &[key, cmd]) {
+            warn!(?e, key, cmd, "keybind failed");
+        }
     }
 }
 
@@ -196,15 +235,29 @@ fn build_mpv(
         // OSC + OSD on so the user gets a control bar on mouse move
         // and overlay messages on seek/volume. mpv's own key bindings
         // stay enabled too: on Linux they reach mpv directly through
-        // wid, and even on macOS the OSC's mouse-driven controls
-        // still use them internally.
-        init.set_property("input-default-bindings", "yes")?;
+        // its window, and even on macOS the OSC's mouse-driven
+        // controls still use them internally.
+        //
+        // mpv 0.36 renamed `input-default-bindings` to
+        // `input-builtin-bindings`; old mpv only knows the old name,
+        // new mpv only the new one. Try both and ignore the error
+        // from whichever isn't recognized so f/space/arrows/etc.
+        // actually do something.
+        let _ = init.set_property("input-builtin-bindings", "yes");
+        let _ = init.set_property("input-default-bindings", "yes");
         init.set_property("input-vo-keyboard", "yes")?;
         init.set_property("input-media-keys", "yes")?;
         init.set_property("osc", "yes")?;
         init.set_property("osd-bar", "yes")?;
         init.set_property("load-stats-overlay", "yes")?;
         init.set_property("cursor-autohide", "1000")?;
+        // Linux/Wayland: ask mpv for a bordered window. mpv defaults
+        // to yes but compositors that don't speak server-side
+        // decorations (GNOME, sway) need mpv to draw its own via
+        // libdecor — that's only available if mpv was built with
+        // it. If your titlebar is still missing after this, the mpv
+        // build lacks libdecor support.
+        init.set_property("border", "yes")?;
 
         #[cfg(target_os = "macos")]
         if let Some(ptr) = mac_view_ptr {
