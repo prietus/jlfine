@@ -14,8 +14,12 @@
 
 use libmpv2::{Mpv, events::Event};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::thread;
 use tracing::{debug, error, info, warn};
+
+#[cfg(target_os = "macos")]
+mod mac;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -82,22 +86,89 @@ fn is_bitperfect(id: &str) -> bool {
     }
 }
 
-/// Fire-and-forget playback. Returns immediately after spawning the
-/// worker thread; the mpv window stays open until the user closes it
-/// or EOF is reached. `audio_device` is the mpv-style id from
+/// Fire-and-forget playback. Returns immediately after dispatching
+/// the work; the mpv window stays open until EOF or until the caller
+/// process exits. `audio_device` is the mpv-style id from
 /// [`list_audio_devices`]; `None` lets mpv pick its default.
+///
+/// Callable from any thread. On macOS the host (this crate) owns the
+/// `NSWindow` and mpv attaches to its contentView via `wid` so the
+/// window stays inside the host's responder chain — the NSWindow
+/// creation is hopped over to the AppKit main thread internally.
 pub fn play(url: impl Into<String>, audio_device: Option<String>) {
     let url = url.into();
-    thread::spawn(move || run(url, audio_device));
+
+    #[cfg(target_os = "macos")]
+    {
+        // jelly-ui's backend loop runs inside a tokio multi_thread
+        // runtime, so this call lands on a worker thread. The
+        // NSWindow needs the main thread (AppKit); mpv itself
+        // expects to live off the main thread (its mac VO dispatches
+        // back to main internally via GCD). So: window on main,
+        // mpv on a worker, key monitor hopped back to main once
+        // mpv exists.
+        mac::run_on_main(move || {
+            let window = mac::VideoWindow::new("jelly · video");
+            let view_ptr = window.view_ptr_for_mpv();
+            let slot_id = mac::register_window(window);
+
+            thread::spawn(move || {
+                let mpv = match build_mpv(audio_device, Some(view_ptr)) {
+                    Ok(m) => Arc::new(m),
+                    Err(e) => {
+                        error!(?e, "mpv init failed");
+                        mac::run_on_main(move || mac::unregister_window(slot_id));
+                        return;
+                    }
+                };
+                // Hop back to main to install the NSEvent monitor —
+                // mpv handle is Send+Sync so cloning the Arc across
+                // threads is fine.
+                let mpv_for_keys = mpv.clone();
+                mac::run_on_main(move || {
+                    mac::install_key_handler(slot_id, mpv_for_keys);
+                });
+
+                if let Err(e) = mpv.command("loadfile", &[&url]) {
+                    error!(?e, "loadfile failed");
+                }
+                pump_mpv_events(&mpv);
+                drop(mpv);
+                mac::run_on_main(move || mac::unregister_window(slot_id));
+            });
+        });
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        thread::spawn(move || {
+            let mpv = match build_mpv(audio_device, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(?e, "mpv init failed");
+                    return;
+                }
+            };
+            if let Err(e) = mpv.command("loadfile", &[&url]) {
+                error!(?e, "loadfile failed");
+                return;
+            }
+            pump_mpv_events(&mpv);
+        });
+    }
 }
 
-fn run(url: String, audio_device: Option<String>) {
-    info!(%url, ?audio_device, "opening mpv window");
-
-    let mpv = match Mpv::with_initializer(|init| {
-        // terminal=yes ships mpv's own logs through our stderr. msg-level
-        // stays at warn by default so we don't drown the host's logs;
-        // bump via MPV_VERBOSE=1 when debugging.
+/// Construct an `Mpv` handle with the project's standard settings —
+/// HDR-aware `gpu-next`, hardware decoding, on-screen controller,
+/// stats overlay. On macOS the caller passes the host NSView's
+/// pointer via `mac_view_ptr` so mpv embeds rendering there instead
+/// of opening its own window.
+fn build_mpv(
+    audio_device: Option<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] mac_view_ptr: Option<isize>,
+) -> Result<Mpv, libmpv2::Error> {
+    Mpv::with_initializer(|init| {
         let verbose = std::env::var("MPV_VERBOSE").is_ok();
         init.set_property("terminal", "yes")?;
         init.set_property(
@@ -111,25 +182,44 @@ fn run(url: String, audio_device: Option<String>) {
         init.set_property("vo", "gpu-next")?;
         init.set_property("hwdec", "auto-safe")?;
         init.set_property("target-colorspace-hint", "yes")?;
-        init.set_property("force-window", "yes")?;
         init.set_property("keep-open", "yes")?;
+        // `force-window=yes` makes mpv create its OWN window even
+        // when we hand it one via `wid` — a phantom NSWindow sits
+        // alongside ours. On macOS with wid set, we don't need it:
+        // the host window already exists. On Linux/Wayland mpv owns
+        // the window so we keep force-window on as a safety net.
+        if mac_view_ptr.is_none() {
+            init.set_property("force-window", "yes")?;
+        }
+        // OSC + OSD on so the user gets a control bar on mouse move
+        // and overlay messages on seek/volume. mpv's own key bindings
+        // stay enabled too: on Linux they reach mpv directly through
+        // wid, and even on macOS the OSC's mouse-driven controls
+        // still use them internally.
+        init.set_property("input-default-bindings", "yes")?;
+        init.set_property("input-vo-keyboard", "yes")?;
+        init.set_property("input-media-keys", "yes")?;
+        init.set_property("osc", "yes")?;
+        init.set_property("osd-bar", "yes")?;
+        init.set_property("load-stats-overlay", "yes")?;
+        init.set_property("cursor-autohide", "1000")?;
+
+        #[cfg(target_os = "macos")]
+        if let Some(ptr) = mac_view_ptr {
+            init.set_property("wid", ptr.to_string())?;
+        }
+
         if let Some(dev) = audio_device.as_deref() {
             init.set_property("audio-device", dev)?;
         }
         Ok(())
-    }) {
-        Ok(m) => m,
-        Err(e) => {
-            error!(?e, "mpv init failed");
-            return;
-        }
-    };
+    })
+}
 
-    if let Err(e) = mpv.command("loadfile", &[&url]) {
-        error!(?e, "loadfile failed");
-        return;
-    }
-
+/// Drain mpv events until shutdown or end-file. Runs on a worker
+/// thread; nothing touched here is main-thread-only.
+fn pump_mpv_events(mpv: &Mpv) {
+    info!("mpv event loop started");
     loop {
         match mpv.wait_event(60.0) {
             Some(Ok(Event::EndFile(reason))) => {
@@ -145,6 +235,5 @@ fn run(url: String, audio_device: Option<String>) {
             None => {}
         }
     }
-
-    info!("mpv window closed");
+    info!("mpv event loop exited");
 }
