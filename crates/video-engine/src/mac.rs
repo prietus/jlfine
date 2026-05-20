@@ -20,9 +20,11 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSBackingStoreType, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSWindowStyleMask, NSWindowWillCloseNotification,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,13 +35,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 /// Owns the NSWindow + content NSView. Dropping it removes the
-/// NSEvent monitor (if installed) and closes the window.
+/// NSEvent monitor + close observer (if installed) and closes the
+/// window.
 pub struct VideoWindow {
     window: Retained<NSWindow>,
     view: Retained<NSView>,
     /// Opaque token returned by `addLocalMonitorForEventsMatchingMask`.
     /// Held so we can pass it back to `removeMonitor` on drop.
     monitor: Option<Retained<AnyObject>>,
+    /// Token returned by `NSNotificationCenter::addObserverForName:`
+    /// for the window close notification. Held so we can hand it back
+    /// to `removeObserver:` on drop.
+    close_observer: Option<Retained<objc2_foundation::NSObject>>,
 }
 
 impl VideoWindow {
@@ -90,6 +97,7 @@ impl VideoWindow {
             window,
             view,
             monitor: None,
+            close_observer: None,
         }
     }
 
@@ -119,6 +127,11 @@ impl VideoWindow {
         // number; `NSEvent::window()` would also work but requires
         // re-fetching a `Retained<NSWindow>` per event.
         let our_window_num = unsafe { self.window.windowNumber() };
+        // Clone the Retained — same Objective-C object, second
+        // strong ref so the block can outlive a hypothetical
+        // assignment to self.window. The block runs on the main
+        // thread, so holding a !Send Retained inside is fine.
+        let window_for_fs = self.window.clone();
 
         let block: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
             RcBlock::new(move |event_ptr: NonNull<NSEvent>| -> *mut NSEvent {
@@ -130,14 +143,22 @@ impl VideoWindow {
                 if win_num != our_window_num {
                     return event_ptr.as_ptr();
                 }
-                let Some(mpv) = mpv_weak.upgrade() else {
-                    // mpv already gone (worker exited); just consume.
-                    return std::ptr::null_mut();
-                };
                 let key = unsafe { event.keyCode() };
                 let mods = unsafe { event.modifierFlags() };
                 let shift = mods.contains(NSEventModifierFlags::NSEventModifierFlagShift);
 
+                // F: native macOS fullscreen instead of mpv's cycle
+                // fullscreen. Animation, dedicated Space, Mission
+                // Control integration — all stock AppKit behavior.
+                if key == 3 {
+                    window_for_fs.toggleFullScreen(None);
+                    return std::ptr::null_mut();
+                }
+
+                let Some(mpv) = mpv_weak.upgrade() else {
+                    // mpv already gone (worker exited); just consume.
+                    return std::ptr::null_mut();
+                };
                 if let Some((cmd, args)) = translate_key(key, shift)
                     && mpv
                         .command(cmd, &args)
@@ -157,6 +178,32 @@ impl VideoWindow {
             )
         };
         self.monitor = token;
+
+        // Wire the close button: when AppKit posts
+        // NSWindowWillCloseNotification for our window, tell mpv to
+        // quit. The worker thread will see the Shutdown event, exit,
+        // and the run_on_main cleanup will drop this VideoWindow.
+        // close() at that point is a no-op since the window is
+        // already closing.
+        let mpv_weak_for_close: Weak<Mpv> = Arc::downgrade(&mpv);
+        let close_block: RcBlock<dyn Fn(NonNull<NSNotification>)> =
+            RcBlock::new(move |_note: NonNull<NSNotification>| {
+                if let Some(mpv) = mpv_weak_for_close.upgrade() {
+                    let _ = mpv
+                        .command("quit", &[])
+                        .map_err(|e| warn!(?e, "mpv quit on window close failed"));
+                }
+            });
+        let center = unsafe { NSNotificationCenter::defaultCenter() };
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWindowWillCloseNotification),
+                Some(self.window.as_ref()),
+                None,
+                &close_block,
+            )
+        };
+        self.close_observer = Some(observer);
     }
 }
 
@@ -171,7 +218,8 @@ fn translate_key(key_code: u16, shift: bool) -> Option<(&'static str, Vec<&'stat
         125 => Some(("seek", vec!["-60"])),           // down
         126 => Some(("seek", vec!["60"])),            // up
         53 => Some(("quit", vec![])),                 // escape
-        3 => Some(("cycle", vec!["fullscreen"])),     // f
+        // F is handled separately by the block — it calls AppKit's
+        // toggleFullScreen on our NSWindow instead of mpv's cycle.
         46 => Some(("cycle", vec!["mute"])),          // m
         0 => Some(("cycle", vec!["audio"])),          // a
         1 => Some(("cycle", vec!["sub"])),            // s
@@ -185,11 +233,18 @@ fn translate_key(key_code: u16, shift: bool) -> Option<(&'static str, Vec<&'stat
 
 impl Drop for VideoWindow {
     fn drop(&mut self) {
+        if let Some(observer) = self.close_observer.take() {
+            unsafe {
+                NSNotificationCenter::defaultCenter().removeObserver(&observer);
+            }
+        }
         if let Some(monitor) = self.monitor.take() {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
         // close() must run on the main thread; the host (Slint event
-        // loop) is the only thread that owns this struct.
+        // loop) is the only thread that owns this struct. If the
+        // user already clicked the X button, the close-observer path
+        // got here first and this is a harmless no-op.
         self.window.close();
     }
 }

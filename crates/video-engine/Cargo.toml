@@ -19,7 +19,12 @@ serde_json.workspace = true
 # crates. We own the player window so mpv (via wid) only does
 # rendering — key events flow through us into mpv_command.
 objc2 = "0.5"
-objc2-foundation = "0.2"
+objc2-foundation = { version = "0.2", features = [
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+    "block2",
+] }
 objc2-app-kit = { version = "0.2", features = [
     "NSWindow",
     "NSView",
