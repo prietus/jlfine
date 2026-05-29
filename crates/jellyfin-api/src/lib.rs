@@ -30,6 +30,7 @@ pub use client::{Client, ItemsQuery, SortOrder};
 pub use error::{Error, Result};
 pub use types::{
     AuthenticationResult, BaseItemDto, ItemType, ItemsResponse, MediaSourceInfo, MediaStream,
-    PublicSystemInfo, UserDto, UserItemDataDto, seconds_to_ticks, ticks_to_seconds,
+    NameGuidPair, PersonInfo, PublicSystemInfo, UserDto, UserItemDataDto, seconds_to_ticks,
+    ticks_to_seconds,
 };
 pub use urls::{ImageOptions, ImageType, audio_stream_url, image_url, video_stream_url};

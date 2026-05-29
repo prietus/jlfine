@@ -66,9 +66,17 @@ pub struct BaseItemDto {
     pub parent_index_number: Option<i32>,
     pub run_time_ticks: Option<i64>,
     pub overview: Option<String>,
+    pub taglines: Option<Vec<String>>,
     pub community_rating: Option<f64>,
+    pub critic_rating: Option<f64>,
     pub official_rating: Option<String>,
     pub genres: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    pub studios: Option<Vec<NameGuidPair>>,
+    pub people: Option<Vec<PersonInfo>>,
+    pub premiere_date: Option<String>,
+    pub production_locations: Option<Vec<String>>,
+    pub provider_ids: Option<HashMap<String, String>>,
     pub image_tags: Option<HashMap<String, String>>,
     pub backdrop_image_tags: Option<Vec<String>>,
     pub image_blur_hashes: Option<ImageBlurHashes>,
@@ -76,6 +84,22 @@ pub struct BaseItemDto {
     pub media_sources: Option<Vec<MediaSourceInfo>>,
     pub media_streams: Option<Vec<MediaStream>>,
     pub child_count: Option<i32>,
+}
+
+/// One entry from a `BaseItemDto`'s `People` array — cast and crew. The
+/// `primary_image_tag`, when present, is the tag for that person's
+/// headshot fetched via the `/Items/{id}/Images/Primary` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PersonInfo {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    /// Character name for actors (e.g. "D'Leh"); empty for crew.
+    pub role: Option<String>,
+    /// "Actor", "Director", "Writer", "Producer", …
+    #[serde(rename = "Type")]
+    pub person_type: Option<String>,
+    pub primary_image_tag: Option<String>,
 }
 
 /// Jellyfin's item-type enum, sent as a string in JSON. Lists below are
