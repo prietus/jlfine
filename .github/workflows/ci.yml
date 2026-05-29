@@ -36,7 +36,9 @@ jobs:
             libfontconfig-dev libxkbcommon-dev
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install mpv
+        run: |
+          brew install mpv
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -60,7 +62,9 @@ jobs:
             libfontconfig-dev libxkbcommon-dev
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install mpv
+        run: |
+          brew install mpv
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
