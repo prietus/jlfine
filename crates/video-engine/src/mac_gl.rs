@@ -14,6 +14,12 @@
 //! `CFBundleGetBundleWithIdentifier("com.apple.opengl")` +
 //! `CFBundleGetFunctionPointerForName(...)` resolves any GL symbol
 //! by name — that's what we hand to libmpv as `get_proc_address`.
+//!
+//! Unused for now: the macOS player uses mpv's own window (see `mac`),
+//! not an `mpv_render_context`. Kept as a checkpoint for a future
+//! in-window OpenGL renderer, so the whole module allows dead code.
+
+#![allow(dead_code)]
 
 use std::ffi::{CStr, c_void};
 
@@ -87,10 +93,8 @@ pub const GL_VIEWPORT: GLenum = 0x0BA2;
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFBundleGetBundleWithIdentifier(bundle_id: *const c_void) -> *const c_void;
-    fn CFBundleGetFunctionPointerForName(
-        bundle: *const c_void,
-        name: *const c_void,
-    ) -> *mut c_void;
+    fn CFBundleGetFunctionPointerForName(bundle: *const c_void, name: *const c_void)
+    -> *mut c_void;
     fn CFStringCreateWithCString(
         alloc: *const c_void,
         c_str: *const i8,

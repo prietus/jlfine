@@ -141,7 +141,6 @@ pub fn play(url: impl Into<String>, audio_device: Option<String>) {
             drop(mpv);
             mac::run_on_main(move || mac::remove_key_monitor(monitor_id));
         });
-        return;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -170,6 +169,7 @@ pub fn play(url: impl Into<String>, audio_device: Option<String>) {
 /// input.conf, so the user sees `[input] No key binding found for
 /// key 'f'.` and nothing happens. Calling `keybind` explicitly
 /// guarantees the bindings exist whatever the build's behaviour.
+#[cfg(not(target_os = "macos"))]
 fn install_default_keybindings(mpv: &Mpv) {
     // (key, command) pairs. Same mapping as the macOS NSEvent
     // monitor — pause/seek/mute/fullscreen/stats/audio/sub cycle/

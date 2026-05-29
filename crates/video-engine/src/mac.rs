@@ -175,11 +175,7 @@ where
     let boxed: Box<F> = Box::new(f);
     let ctx = Box::into_raw(boxed) as *mut c_void;
     unsafe {
-        dispatch_async_f(
-            &raw const _dispatch_main_q as *const c_void,
-            ctx,
-            trampoline::<F>,
-        );
+        dispatch_async_f(&raw const _dispatch_main_q, ctx, trampoline::<F>);
     }
 }
 
@@ -208,11 +204,7 @@ where
     };
     let ctx = &mut payload as *mut Payload<F, T> as *mut c_void;
     unsafe {
-        dispatch_sync_f(
-            &raw const _dispatch_main_q as *const c_void,
-            ctx,
-            trampoline::<F, T>,
-        );
+        dispatch_sync_f(&raw const _dispatch_main_q, ctx, trampoline::<F, T>);
     }
     payload
         .result
