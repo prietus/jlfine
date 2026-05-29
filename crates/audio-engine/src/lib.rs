@@ -564,6 +564,9 @@ fn pack_dsf_to_dsd_native<R: std::io::Read>(
         if cancel.load(Ordering::Acquire) {
             return;
         }
+        // 2D index here (slot over the 4-byte frame, ch over channels)
+        // reads clearest as a range loop.
+        #[allow(clippy::needless_range_loop)]
         for slot in 0..4 {
             match reader.next_byte_per_channel(&mut byte_per_ch) {
                 Ok(true) => {
