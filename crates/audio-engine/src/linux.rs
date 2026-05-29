@@ -9,9 +9,13 @@
 //! bitperfect guarantee on Linux.
 //!
 //! Exclusive toggle semantics (mirrors macOS HogMode):
-//! - `exclusive=true` requires an `alsa/hw:` id; anything else
-//!   means the user picked a mixer-routed device and bitperfect
-//!   isn't honest, so we warn and refuse.
+//! - `exclusive=true` opens the raw `hw:` PCM. The user-picked id
+//!   is smart-upgraded: `alsa/<plugin>:CARD=X[,DEV=Y]` (e.g.
+//!   `front:`/`plughw:`/`sysdefault:`/`dsnoop:`) is rewritten to
+//!   `hw:CARD=X,DEV=Y` so we skip dmix/plug → real bitperfect on
+//!   the picked card. Ids without a `CARD=` param (`pipewire`,
+//!   `pulse`, bare `default`) can never be bitperfect and we
+//!   refuse them so the user picks an actual hardware device.
 //! - `exclusive=false` opens the device as-is (Pipewire/Pulse
 //!   passthrough is fine), with the system mixer doing whatever
 //!   conversions it wants.
@@ -27,8 +31,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum AlsaError {
-    /// `exclusive=true` but the user picked an id we can't open
-    /// bitperfect (anything that doesn't start with `alsa/hw:`).
+    /// `exclusive=true` but the user picked an id we can't upgrade
+    /// to a raw `hw:` (no `CARD=` param — `pipewire`, `pulse`,
+    /// bare `default`).
     NotBitperfect(String),
     Open(alsa::Error),
     HwParams(alsa::Error),
@@ -195,24 +200,49 @@ pub fn play_stream(
 
 fn resolve_device(audio_device: Option<&str>, exclusive: bool) -> Result<String, AlsaError> {
     let raw = audio_device.unwrap_or("");
-
-    // Empty / `auto` / not-an-alsa id → system default. In shared
-    // mode that's fine; in exclusive mode it's a lie — refuse so the
-    // user notices their pick was wrong, rather than silently
-    // routing through Pipewire while we claim to be bitperfect.
     let alsa_inner = raw.strip_prefix("alsa/");
 
     if exclusive {
-        match alsa_inner {
-            Some(rest) if rest.starts_with("hw:") => Ok(rest.to_string()),
-            _ => Err(AlsaError::NotBitperfect(raw.to_string())),
+        // `hw:` already → ideal, use as-is.
+        // `<plugin>:CARD=X[,DEV=Y]` (front/plughw/sysdefault/dsnoop/…)
+        // → upgrade to `hw:CARD=X,DEV=Y` so we open the raw hardware
+        // and skip dmix/plug → real bitperfect on the user's DAC.
+        // Anything else (Pipewire, Pulse, bare `default`, non-alsa id)
+        // can never be bitperfect → refuse so the user picks a real
+        // hardware id.
+        let Some(rest) = alsa_inner else {
+            return Err(AlsaError::NotBitperfect(raw.to_string()));
+        };
+        if rest.starts_with("hw:") {
+            return Ok(rest.to_string());
         }
+        if let Some(hw) = upgrade_to_hw(rest) {
+            tracing::info!(from = %raw, to = %hw, "upgraded ALSA device id to raw hw: for bitperfect");
+            return Ok(hw);
+        }
+        Err(AlsaError::NotBitperfect(raw.to_string()))
     } else {
         match alsa_inner {
             Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
             _ => Ok("default".to_string()),
         }
     }
+}
+
+/// Rewrite an ALSA device id with `CARD=`/`DEV=` hints to the raw
+/// `hw:` form. `front:CARD=x20,DEV=0` → `hw:CARD=x20,DEV=0` —
+/// bypasses dmix/plug and lets the kernel give us the raw PCM. DEV
+/// defaults to `0` when omitted (e.g. `sysdefault:CARD=X`). Returns
+/// `None` for ids without a `CARD=` param (Pipewire, Pulse, bare
+/// `default`), which can never be bitperfect.
+fn upgrade_to_hw(rest: &str) -> Option<String> {
+    let (_plugin, params) = rest.split_once(':')?;
+    let card = params.split(',').find_map(|p| p.strip_prefix("CARD="))?;
+    let dev = params
+        .split(',')
+        .find_map(|p| p.strip_prefix("DEV="))
+        .unwrap_or("0");
+    Some(format!("hw:CARD={card},DEV={dev}"))
 }
 
 fn pick_format(pcm: &PCM, sample_rate: f64, channels: u32) -> Result<Format, alsa::Error> {
