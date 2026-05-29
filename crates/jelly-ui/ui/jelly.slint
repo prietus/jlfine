@@ -21,12 +21,20 @@ export struct Item {
     has-image: bool,
     item-type: string,
     track-index: int,
+    tech: string,
 }
 
 export struct AudioDeviceItem {
     id: string,
     description: string,
     bitperfect: bool,
+}
+
+export struct CastMember {
+    name: string,
+    character: string,
+    image: image,
+    has-image: bool,
 }
 
 export enum Screen { login, library, settings }
@@ -265,10 +273,161 @@ component Card inherits Rectangle {
     }
 }
 
+component GenreChip inherits Rectangle {
+    in property <string> label;
+    height: 22px;
+    width: chip-text.preferred-width + 18px;
+    border-radius: 11px;
+    background: #ffffff10;
+
+    chip-text := Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 11px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        x: 9px;
+        y: 0;
+        width: parent.width - 18px;
+        height: parent.height;
+    }
+}
+
+component CastCard inherits Rectangle {
+    in property <CastMember> data;
+    width: 92px;
+
+    Rectangle {
+        x: (parent.width - 80px) / 2;
+        y: 0;
+        width: 80px;
+        height: 80px;
+        border-radius: 40px;
+        clip: true;
+        background: #1a1d24;
+        if !root.data.has-image: Rectangle {
+            background: @linear-gradient(135deg, #262b38 0%, #1a1d24 100%);
+            Text {
+                text: "👤";
+                font-size: 30px;
+                color: #4a5060;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        if root.data.has-image: Image {
+            source: root.data.image;
+            width: 100%;
+            height: 100%;
+            image-fit: cover;
+        }
+    }
+    Text {
+        x: 0;
+        y: 86px;
+        width: 100%;
+        text: root.data.name;
+        color: Theme.text-primary;
+        font-size: 11px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+    Text {
+        x: 0;
+        y: 120px;
+        width: 100%;
+        text: root.data.character;
+        color: Theme.text-muted;
+        font-size: 10px;
+        horizontal-alignment: center;
+        overflow: elide;
+    }
+}
+
+// Action button used for Reproducir (primary) / Descargar (secondary)
+// on the detail page.
+component DetailButton inherits TouchArea {
+    in property <string> label;
+    in property <bool> primary;
+    mouse-cursor: pointer;
+
+    Rectangle {
+        border-radius: 8px;
+        background: root.primary
+            ? (parent.has-hover ? Theme.accent-hover : Theme.accent)
+            : (parent.has-hover ? #ffffff1c : #ffffff12);
+        animate background { duration: 120ms; }
+        Text {
+            text: root.label;
+            color: root.primary ? #0c0d10 : Theme.text-primary;
+            font-size: 13px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Small outlined pill for external links (IMDb / TMDB).
+component LinkPill inherits TouchArea {
+    in property <string> label;
+    mouse-cursor: pointer;
+    Rectangle {
+        background: parent.has-hover ? #ffffff18 : #ffffff0e;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.stroke-faint;
+        animate background { duration: 120ms; }
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: 11px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Horizontally-scrollable row of pill chips (genres / tags / media info).
+component ChipRow inherits Flickable {
+    in property <[string]> chips;
+    viewport-width: row.preferred-width;
+    viewport-height: self.height;
+    row := HorizontalLayout {
+        height: parent.height;
+        width: self.preferred-width;
+        spacing: 6px;
+        for c in root.chips: GenreChip {
+            label: c;
+        }
+    }
+}
+
+// Horizontally-scrollable cast strip.
+component CastStrip inherits Flickable {
+    in property <[CastMember]> cast;
+    viewport-width: row.preferred-width;
+    viewport-height: self.height;
+    row := HorizontalLayout {
+        height: parent.height;
+        width: self.preferred-width;
+        spacing: 12px;
+        padding-right: 32px;
+        for c in root.cast: CastCard {
+            data: c;
+        }
+    }
+}
+
 component TrackRow inherits Rectangle {
     in property <int> index;
     in property <string> title;
     in property <string> duration;
+    in property <string> tech;
     in property <bool> alt;
     callback clicked();
     height: 44px;
@@ -322,6 +481,15 @@ component TrackRow inherits Rectangle {
             overflow: elide;
         }
         Text {
+            text: root.tech;
+            visible: root.tech != "";
+            color: Theme.text-muted;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+        Text {
             text: root.duration;
             color: Theme.text-muted;
             font-size: 13px;
@@ -350,11 +518,42 @@ component LibraryScreen inherits Rectangle {
     in property <bool> can-go-back: false;
     in property <image> album-image;
     in property <bool> album-has-image: false;
+    in property <string> album-artist: "";
+    in property <string> album-meta: "";
+    in property <[string]> album-genres: [];
+    in property <string> album-overview: "";
+    in property <string> album-wikipedia-url: "";
+    in property <string> album-download-label: "⬇  Descargar álbum";
+    in property <bool> album-download-enabled: true;
+    in property <bool> album-download-active: false;
+    // detail page (movies / series)
+    in property <image> detail-backdrop;
+    in property <bool> detail-has-backdrop: false;
+    in property <string> detail-meta: "";
+    in property <string> detail-tagline: "";
+    in property <string> detail-overview: "";
+    in property <string> detail-director: "";
+    in property <string> detail-writers: "";
+    in property <[string]> detail-genres: [];
+    in property <[CastMember]> detail-cast: [];
+    in property <string> detail-premiere: "";
+    in property <string> detail-country: "";
+    in property <string> detail-studios: "";
+    in property <[string]> detail-tags: [];
+    in property <[string]> detail-media-info: [];
+    in property <string> detail-imdb-url: "";
+    in property <string> detail-tmdb-url: "";
+    in property <bool> detail-can-play: false;
+    in property <string> detail-children-label: "";
     callback select-view(int, string, string);
     callback sign-out();
     callback activate-item(string, string);
     callback back-clicked();
     callback open-settings();
+    callback open-url(string);
+    callback download-album();
+    callback play-detail();
+    callback download-detail();
 
     background: Theme.bg-base;
 
@@ -369,12 +568,6 @@ component LibraryScreen inherits Rectangle {
                 padding: 16px;
                 spacing: 6px;
 
-                Text {
-                    text: "jelly";
-                    font-size: 22px;
-                    font-weight: 700;
-                    color: Theme.text-primary;
-                }
                 Text {
                     text: "Signed in as " + root.user-name;
                     color: Theme.text-muted;
@@ -509,7 +702,7 @@ component LibraryScreen inherits Rectangle {
                         y: 0;
                         width: parent.width;
                         height: parent.height;
-                        visible: root.view-mode != "tracklist";
+                        visible: root.view-mode == "grid";
                         property <int> cols: max(1, floor((self.width - 32px - 32px) / (180px + 20px)));
                         property <int> rows: ceil(root.items.length / max(1, self.cols));
                         viewport-width: self.width;
@@ -532,12 +725,16 @@ component LibraryScreen inherits Rectangle {
                         height: parent.height;
                         visible: root.view-mode == "tracklist";
                         viewport-width: self.width;
-                        viewport-height: max(self.height, root.items.length * 48px + 232px);
+                        // Header is fixed 232px (200 cover + 16 top + 16 bottom).
+                        // Overview card sits between header and tracks when
+                        // there's text; otherwise we collapse the gap and
+                        // tracks start right after the header.
+                        property <length> header-h: 232px;
+                        property <length> overview-h: root.album-overview != "" ? 156px : 0px;
+                        property <length> tracks-start: self.header-h + self.overview-h;
+                        viewport-height: max(self.height, root.items.length * 48px + self.tracks-start + 32px);
 
-                        // Album cover sits at the top of the scrollable
-                        // area so it scrolls away when the user looks at
-                        // the lower tracks. Placeholder gradient while
-                        // the image streams in.
+                        // ── Header row: cover + title/artist/meta/genres ──
                         Rectangle {
                             x: 32px;
                             y: 16px;
@@ -560,16 +757,423 @@ component LibraryScreen inherits Rectangle {
                             }
                         }
 
+                        // Right-of-cover column. Title is already shown in
+                        // the top nav so we lead with the artist, then the
+                        // meta line (year · pistas · duración), then chips.
+                        Text {
+                            x: 252px;
+                            y: 22px;
+                            width: parent.width - 252px - 32px;
+                            text: root.album-artist;
+                            color: Theme.text-primary;
+                            font-size: 22px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        Text {
+                            x: 252px;
+                            y: 60px;
+                            width: parent.width - 252px - 32px;
+                            text: root.album-meta;
+                            color: Theme.text-muted;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+
+                        HorizontalLayout {
+                            x: 252px;
+                            y: 92px;
+                            width: parent.width - 252px - 32px;
+                            height: 22px;
+                            spacing: 6px;
+                            alignment: start;
+                            for g in root.album-genres: GenreChip {
+                                label: g;
+                            }
+                        }
+
+                        // Descargar pill. Disabled while the actual
+                        // download task is in flight; the label switches
+                        // to "Descargando 3/12…" from Rust.
+                        download-ta := TouchArea {
+                            x: 252px;
+                            y: 132px;
+                            width: 200px;
+                            height: 32px;
+                            enabled: root.album-download-enabled;
+                            mouse-cursor: root.album-download-enabled ? pointer : default;
+                            clicked => { root.download-album(); }
+                            Rectangle {
+                                background: root.album-download-active
+                                    ? #ffffff14
+                                    : (download-ta.has-hover && root.album-download-enabled ? Theme.accent-hover : Theme.accent);
+                                border-radius: 16px;
+                                opacity: root.album-download-enabled || root.album-download-active ? 1.0 : 0.5;
+                                animate background, opacity { duration: 140ms; }
+                                Text {
+                                    text: root.album-download-label;
+                                    color: #0c0d10;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // ── Overview / Reseña card ──────────────────────
+                        if root.album-overview != "": Rectangle {
+                            x: 32px;
+                            y: parent.header-h + 4px;
+                            width: parent.width - 64px;
+                            height: 140px;
+                            background: #ffffff06;
+                            border-radius: 12px;
+                            border-width: 1px;
+                            border-color: Theme.stroke-faint;
+
+                            Text {
+                                x: 18px;
+                                y: 14px;
+                                text: "RESEÑA";
+                                color: Theme.text-muted;
+                                font-size: 10px;
+                                letter-spacing: 1.4px;
+                                font-weight: 600;
+                            }
+
+                            // Wikipedia pill, only when we extracted a URL.
+                            if root.album-wikipedia-url != "": TouchArea {
+                                x: parent.width - self.width - 14px;
+                                y: 10px;
+                                width: 100px;
+                                height: 24px;
+                                mouse-cursor: pointer;
+                                clicked => { root.open-url(root.album-wikipedia-url); }
+                                Rectangle {
+                                    background: parent.has-hover ? #ffffff18 : #ffffff10;
+                                    border-radius: 12px;
+                                    animate background { duration: 120ms; }
+                                    Text {
+                                        text: "🔗  Wikipedia";
+                                        color: Theme.text-primary;
+                                        font-size: 11px;
+                                        font-weight: 500;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Text {
+                                x: 18px;
+                                y: 36px;
+                                width: parent.width - 36px;
+                                height: parent.height - 50px;
+                                text: root.album-overview;
+                                color: Theme.text-primary;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                            }
+                        }
+
                         for it[i] in root.items: TrackRow {
                             x: 32px;
-                            y: 232px + i * 48px;
+                            y: parent.tracks-start + i * 48px;
                             width: parent.width - 64px;
                             index: it.track-index > 0 ? it.track-index : i + 1;
                             title: it.title;
                             duration: it.subtitle;
+                            tech: it.tech;
                             alt: mod(i, 2) == 1;
                             clicked => {
                                 root.activate-item(it.id, it.item-type);
+                            }
+                        }
+                    }
+
+                    // ── Detail page: movie / series metadata ──────────
+                    detail := Flickable {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        visible: root.view-mode == "detail";
+                        viewport-width: self.width;
+
+                        property <length> cw: self.width - 64px;
+                        // Vertical offset chain. Each section collapses to
+                        // 0 height when its content is empty so gaps don't
+                        // accumulate. Mirrors the tracklist's fixed-height
+                        // approach (absolute positioning re-reacts reliably
+                        // where conditional layout children don't).
+                        property <length> y-meta: 256px;
+                        property <length> y-buttons: self.y-meta + 32px;
+                        property <length> h-buttons: root.detail-can-play ? 40px : 0px;
+                        property <length> y-tagline: self.y-buttons + self.h-buttons + (root.detail-can-play ? 18px : 8px);
+                        property <length> h-tagline: root.detail-tagline != "" ? 24px : 0px;
+                        property <length> y-overview: self.y-tagline + self.h-tagline + (root.detail-tagline != "" ? 8px : 0px);
+                        property <length> h-overview: root.detail-overview != "" ? 92px : 0px;
+                        property <length> y-director: self.y-overview + self.h-overview + 16px;
+                        property <length> h-director: root.detail-director != "" ? 20px : 0px;
+                        property <length> y-writers: self.y-director + self.h-director;
+                        property <length> h-writers: root.detail-writers != "" ? 20px : 0px;
+                        property <length> y-genres: self.y-writers + self.h-writers + 14px;
+                        property <length> h-genres: root.detail-genres.length > 0 ? 24px : 0px;
+                        property <length> y-cast-label: self.y-genres + self.h-genres + (root.detail-genres.length > 0 ? 18px : 0px);
+                        property <length> h-cast-label: root.detail-cast.length > 0 ? 22px : 0px;
+                        property <length> y-cast: self.y-cast-label + self.h-cast-label + 6px;
+                        property <length> h-cast: root.detail-cast.length > 0 ? 148px : 0px;
+                        property <length> y-facts: self.y-cast + self.h-cast + (root.detail-cast.length > 0 ? 16px : 0px);
+                        property <length> h-premiere: root.detail-premiere != "" ? 20px : 0px;
+                        property <length> h-country: root.detail-country != "" ? 20px : 0px;
+                        property <length> h-studios: root.detail-studios != "" ? 20px : 0px;
+                        property <length> y-tags: self.y-facts + self.h-premiere + self.h-country + self.h-studios + 12px;
+                        property <length> h-tags: root.detail-tags.length > 0 ? 24px : 0px;
+                        property <length> y-media-label: self.y-tags + self.h-tags + 18px;
+                        property <length> h-media-label: root.detail-media-info.length > 0 ? 22px : 0px;
+                        property <length> y-media: self.y-media-label + self.h-media-label + 6px;
+                        property <length> h-media: root.detail-media-info.length > 0 ? 24px : 0px;
+                        property <length> y-links: self.y-media + self.h-media + 16px;
+                        property <length> h-links: (root.detail-imdb-url != "" || root.detail-tmdb-url != "") ? 30px : 0px;
+                        property <length> y-children-label: self.y-links + self.h-links + 26px;
+                        property <length> h-children-label: root.detail-children-label != "" ? 24px : 0px;
+                        property <length> y-children: self.y-children-label + self.h-children-label + 12px;
+                        property <int> grid-cols: max(1, floor(self.cw / (180px + 20px)));
+                        property <int> grid-rows: ceil(root.items.length / max(1, self.grid-cols));
+                        property <length> h-children: root.items.length > 0 ? self.grid-rows * (250px + 20px) : 0px;
+                        viewport-height: max(self.height, self.y-children + self.h-children + 48px);
+
+                        // Backdrop (full-bleed) + bottom fade into the page.
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width;
+                            height: 240px;
+                            clip: true;
+                            background: #14161b;
+                            if root.detail-has-backdrop: Image {
+                                source: root.detail-backdrop;
+                                width: 100%;
+                                height: 100%;
+                                image-fit: cover;
+                            }
+                            Rectangle {
+                                width: 100%;
+                                height: 100%;
+                                background: @linear-gradient(180deg, #0c0d1000 40%, #0c0d10cc 80%, Theme.bg-base 100%);
+                            }
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-meta;
+                            width: parent.cw;
+                            text: root.detail-meta;
+                            color: Theme.text-muted;
+                            font-size: 13px;
+                        }
+
+                        // Reproducir / Descargar.
+                        play-btn := DetailButton {
+                            x: 32px;
+                            y: parent.y-buttons;
+                            width: 150px;
+                            height: 36px;
+                            visible: root.detail-can-play;
+                            primary: true;
+                            label: "▶  Reproducir";
+                            clicked => { root.play-detail(); }
+                        }
+                        // Hidden until video download lands (#21) — the
+                        // handler is wired but does nothing yet, so we
+                        // don't ship a dead button in the beta.
+                        DetailButton {
+                            x: 196px;
+                            y: parent.y-buttons;
+                            width: 150px;
+                            height: 36px;
+                            visible: false;
+                            primary: false;
+                            label: "⬇  Descargar";
+                            clicked => { root.download-detail(); }
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-tagline;
+                            width: parent.cw;
+                            visible: root.detail-tagline != "";
+                            text: root.detail-tagline;
+                            color: Theme.text-muted;
+                            font-size: 14px;
+                            font-italic: true;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-overview;
+                            width: parent.cw;
+                            height: parent.h-overview;
+                            visible: root.detail-overview != "";
+                            text: root.detail-overview;
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            wrap: word-wrap;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-director;
+                            width: parent.cw;
+                            visible: root.detail-director != "";
+                            text: root.detail-director;
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+                        Text {
+                            x: 32px;
+                            y: parent.y-writers;
+                            width: parent.cw;
+                            visible: root.detail-writers != "";
+                            text: root.detail-writers;
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+
+                        ChipRow {
+                            x: 32px;
+                            y: parent.y-genres;
+                            width: parent.cw;
+                            height: parent.h-genres;
+                            visible: root.detail-genres.length > 0;
+                            chips: root.detail-genres;
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-cast-label;
+                            width: parent.cw;
+                            visible: root.detail-cast.length > 0;
+                            text: "Reparto";
+                            color: Theme.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+                        CastStrip {
+                            x: 32px;
+                            y: parent.y-cast;
+                            width: parent.cw;
+                            height: parent.h-cast;
+                            visible: root.detail-cast.length > 0;
+                            cast: root.detail-cast;
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-facts;
+                            width: parent.cw;
+                            visible: root.detail-premiere != "";
+                            text: root.detail-premiere;
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            x: 32px;
+                            y: parent.y-facts + parent.h-premiere;
+                            width: parent.cw;
+                            visible: root.detail-country != "";
+                            text: root.detail-country;
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                        }
+                        Text {
+                            x: 32px;
+                            y: parent.y-facts + parent.h-premiere + parent.h-country;
+                            width: parent.cw;
+                            visible: root.detail-studios != "";
+                            text: root.detail-studios;
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+
+                        ChipRow {
+                            x: 32px;
+                            y: parent.y-tags;
+                            width: parent.cw;
+                            height: parent.h-tags;
+                            visible: root.detail-tags.length > 0;
+                            chips: root.detail-tags;
+                        }
+
+                        Text {
+                            x: 32px;
+                            y: parent.y-media-label;
+                            width: parent.cw;
+                            visible: root.detail-media-info.length > 0;
+                            text: "Información del medio";
+                            color: Theme.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+                        ChipRow {
+                            x: 32px;
+                            y: parent.y-media;
+                            width: parent.cw;
+                            height: parent.h-media;
+                            visible: root.detail-media-info.length > 0;
+                            chips: root.detail-media-info;
+                        }
+
+                        imdb-link := LinkPill {
+                            x: 32px;
+                            y: parent.y-links;
+                            width: 92px;
+                            height: 28px;
+                            visible: root.detail-imdb-url != "";
+                            label: "↗  IMDb";
+                            clicked => { root.open-url(root.detail-imdb-url); }
+                        }
+                        LinkPill {
+                            x: root.detail-imdb-url != "" ? 136px : 32px;
+                            y: parent.y-links;
+                            width: 92px;
+                            height: 28px;
+                            visible: root.detail-tmdb-url != "";
+                            label: "↗  TMDB";
+                            clicked => { root.open-url(root.detail-tmdb-url); }
+                        }
+
+                        // Series children (seasons / episodes).
+                        Text {
+                            x: 32px;
+                            y: parent.y-children-label;
+                            width: parent.cw;
+                            visible: root.detail-children-label != "";
+                            text: root.detail-children-label;
+                            color: Theme.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+                        Rectangle {
+                            x: 32px;
+                            y: parent.y-children;
+                            width: parent.cw;
+                            height: parent.h-children;
+                            visible: root.items.length > 0;
+                            for it[i] in root.items: Card {
+                                x: mod(i, detail.grid-cols) * (180px + 20px);
+                                y: floor(i / max(1, detail.grid-cols)) * (250px + 20px);
+                                data: it;
+                                clicked => {
+                                    root.activate-item(it.id, it.item-type);
+                                }
                             }
                         }
                     }
@@ -683,7 +1287,7 @@ component DeviceDropdown inherits Rectangle {
                 overflow: elide;
             }
             Text {
-                text: "⌄";
+                text: "▾";
                 color: Theme.text-muted;
                 font-size: 14px;
                 vertical-alignment: center;
@@ -875,10 +1479,8 @@ component SettingsScreen inherits Rectangle {
         }
     }
 
-    // Tab strip — only Audio is active for v1. The others are present
-    // for visual parity with the macOS reference design; they'll grow
-    // real content in later iterations (Last.fm scrobble, Jellystat,
-    // Discogs metadata).
+    // Tab strip — Audio is the only section today. Last.fm / Jellystat
+    // / Discogs tabs will be added back when those integrations land.
     Rectangle {
         x: 0;
         y: 56px;
@@ -888,10 +1490,7 @@ component SettingsScreen inherits Rectangle {
             x: (parent.width - self.width) / 2;
             spacing: 6px;
             y: 8px;
-            SettingsTab { label: "Audio";    icon: "🔊"; active: true;  }
-            SettingsTab { label: "Last.fm";  icon: "♬"; enabled-tab: false; }
-            SettingsTab { label: "Jellystat"; icon: "▤"; enabled-tab: false; }
-            SettingsTab { label: "Discogs";  icon: "◎"; enabled-tab: false; }
+            SettingsTab { label: "Audio"; icon: "🔊"; active: true; }
         }
     }
 
@@ -1036,6 +1635,32 @@ export component MainWindow inherits Window {
     in property <bool> can-go-back: false;
     in property <image> album-image;
     in property <bool> album-has-image: false;
+    in property <string> album-artist: "";
+    in property <string> album-meta: "";
+    in property <[string]> album-genres: [];
+    in property <string> album-overview: "";
+    in property <string> album-wikipedia-url: "";
+    in property <string> album-download-label: "⬇  Descargar álbum";
+    in property <bool> album-download-enabled: true;
+    in property <bool> album-download-active: false;
+    in property <image> detail-backdrop;
+    in property <bool> detail-has-backdrop: false;
+    in property <string> detail-meta: "";
+    in property <string> detail-tagline: "";
+    in property <string> detail-overview: "";
+    in property <string> detail-director: "";
+    in property <string> detail-writers: "";
+    in property <[string]> detail-genres: [];
+    in property <[CastMember]> detail-cast: [];
+    in property <string> detail-premiere: "";
+    in property <string> detail-country: "";
+    in property <string> detail-studios: "";
+    in property <[string]> detail-tags: [];
+    in property <[string]> detail-media-info: [];
+    in property <string> detail-imdb-url: "";
+    in property <string> detail-tmdb-url: "";
+    in property <bool> detail-can-play: false;
+    in property <string> detail-children-label: "";
     in property <[AudioDeviceItem]> audio-devices: [];
     in property <string> selected-audio-device: "";
     in property <string> selected-audio-device-label: "System default";
@@ -1051,6 +1676,10 @@ export component MainWindow inherits Window {
     callback select-audio-device(string);
     callback set-exclusive-mode(bool);
     callback refresh-devices();
+    callback open-url(string);
+    callback download-album();
+    callback play-detail();
+    callback download-detail();
 
     // Two screens; cross-fade between them with opacity.
     login := LoginScreen {
@@ -1091,6 +1720,36 @@ export component MainWindow inherits Window {
         can-go-back: root.can-go-back;
         album-image: root.album-image;
         album-has-image: root.album-has-image;
+        album-artist: root.album-artist;
+        album-meta: root.album-meta;
+        album-genres: root.album-genres;
+        album-overview: root.album-overview;
+        album-wikipedia-url: root.album-wikipedia-url;
+        album-download-label: root.album-download-label;
+        album-download-enabled: root.album-download-enabled;
+        album-download-active: root.album-download-active;
+        detail-backdrop: root.detail-backdrop;
+        detail-has-backdrop: root.detail-has-backdrop;
+        detail-meta: root.detail-meta;
+        detail-tagline: root.detail-tagline;
+        detail-overview: root.detail-overview;
+        detail-director: root.detail-director;
+        detail-writers: root.detail-writers;
+        detail-genres: root.detail-genres;
+        detail-cast: root.detail-cast;
+        detail-premiere: root.detail-premiere;
+        detail-country: root.detail-country;
+        detail-studios: root.detail-studios;
+        detail-tags: root.detail-tags;
+        detail-media-info: root.detail-media-info;
+        detail-imdb-url: root.detail-imdb-url;
+        detail-tmdb-url: root.detail-tmdb-url;
+        detail-can-play: root.detail-can-play;
+        detail-children-label: root.detail-children-label;
+        open-url(u) => { root.open-url(u); }
+        download-album => { root.download-album(); }
+        play-detail => { root.play-detail(); }
+        download-detail => { root.download-detail(); }
         select-view(i, id, ct) => {
             root.selected-view = i;
             root.view-selected(id, ct);

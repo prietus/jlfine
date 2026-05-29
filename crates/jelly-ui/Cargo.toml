@@ -20,6 +20,7 @@ tracing.workspace = true
 reqwest.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 futures-util.workspace = true
+directories.workspace = true
 
 [build-dependencies]
 slint-build = "1.8"

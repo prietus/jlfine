@@ -21,7 +21,8 @@ use audio_engine::AudioEngine;
 use jelly_storage::Storage;
 use jellyfin_api::{
     BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
-    SortOrder, audio_stream_url, image_url, ticks_to_seconds, video_stream_url,
+    MediaStream, PersonInfo, SortOrder, audio_stream_url, image_url, ticks_to_seconds,
+    video_stream_url,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
@@ -116,9 +117,7 @@ pub fn run() -> Result<()> {
     window.on_select_audio_device({
         let cmd_tx = cmd_tx.clone();
         move |id| {
-            let _ = cmd_tx.send(BackendCmd::SelectAudioDevice {
-                id: id.to_string(),
-            });
+            let _ = cmd_tx.send(BackendCmd::SelectAudioDevice { id: id.to_string() });
         }
     });
     window.on_set_exclusive_mode({
@@ -131,6 +130,35 @@ pub fn run() -> Result<()> {
         let cmd_tx = cmd_tx.clone();
         move || {
             let _ = cmd_tx.send(BackendCmd::RefreshDevices);
+        }
+    });
+    // Spawn the user's default browser asynchronously. Failures get
+    // logged — we never want a missing handler to surface as a panic
+    // inside the Slint callback.
+    window.on_open_url(|u| {
+        let url = u.to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = open_external_url(&url) {
+                warn!(%url, ?e, "open url failed");
+            }
+        });
+    });
+    window.on_download_album({
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(BackendCmd::DownloadAlbum);
+        }
+    });
+    window.on_play_detail({
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(BackendCmd::PlayDetail);
+        }
+    });
+    window.on_download_detail({
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(BackendCmd::DownloadDetail);
         }
     });
 
@@ -163,6 +191,11 @@ enum BackendCmd {
     SetExclusiveMode {
         value: bool,
     },
+    DownloadAlbum,
+    /// Reproducir on the movie detail page.
+    PlayDetail,
+    /// Descargar on the movie detail page.
+    DownloadDetail,
 }
 
 // ---------------------------------------------------------------- nav model
@@ -176,6 +209,9 @@ struct NavEntry {
     /// Header subtitle for this level (filled in after fetching).
     subtitle: String,
     children: ChildrenType,
+    /// Populated only when this nav level is an album's tracklist —
+    /// the artist for path construction at download time.
+    album_artist: Option<String>,
 }
 
 /// Determines the filter / sort applied when fetching children of a
@@ -183,11 +219,17 @@ struct NavEntry {
 /// type; deeper levels just enumerate the right item kind.
 #[derive(Clone)]
 enum ChildrenType {
-    LibraryRoot { collection_type: String },
+    LibraryRoot {
+        collection_type: String,
+    },
     Tracks,
-    Seasons,
     Episodes,
     PlaylistItems,
+    /// A movie's metadata detail page — a leaf with no children list.
+    MovieDetail,
+    /// A series' metadata detail page; its children (seasons) render
+    /// below the metadata.
+    SeriesDetail,
 }
 
 impl ChildrenType {
@@ -200,6 +242,12 @@ impl ChildrenType {
                 "PrimaryImageAspectRatio".into(),
                 "Genres".into(),
                 "ChildCount".into(),
+                "Overview".into(),
+                // MediaSources isn't returned by default; we need it
+                // for download (correct file extension via .path) and
+                // it lets us hint symphonia properly during playback.
+                "MediaSources".into(),
+                "Path".into(),
             ],
             sort_order: Some(SortOrder::Ascending),
             ..Default::default()
@@ -231,11 +279,14 @@ impl ChildrenType {
                 q.sort_by = vec!["ParentIndexNumber".into(), "IndexNumber".into()];
                 q.recursive = Some(false); // direct children only
             }
-            ChildrenType::Seasons => {
+            ChildrenType::SeriesDetail => {
                 q.include_item_types = vec![ItemType::Season];
                 q.sort_by = vec!["IndexNumber".into()];
                 q.recursive = Some(false);
             }
+            // No children list to fetch; activate() short-circuits the
+            // fetch and just populates the detail page.
+            ChildrenType::MovieDetail => {}
             ChildrenType::Episodes => {
                 q.include_item_types = vec![ItemType::Episode];
                 q.sort_by = vec!["IndexNumber".into()];
@@ -260,15 +311,18 @@ impl ChildrenType {
                 _ => "",
             },
             ChildrenType::Tracks => "music",
-            ChildrenType::Seasons | ChildrenType::Episodes => "tvshows",
+            ChildrenType::Episodes | ChildrenType::SeriesDetail => "tvshows",
+            ChildrenType::MovieDetail => "movies",
             ChildrenType::PlaylistItems => "playlists",
         }
     }
 
-    /// "grid" of cards (default) vs. "tracklist" of rows for music.
+    /// "grid" of cards (default), "tracklist" of rows for music, or
+    /// "detail" for the movie/series metadata page.
     fn display_mode(&self) -> &'static str {
         match self {
             ChildrenType::Tracks => "tracklist",
+            ChildrenType::MovieDetail | ChildrenType::SeriesDetail => "detail",
             _ => "grid",
         }
     }
@@ -339,7 +393,10 @@ async fn backend_loop(
             | BackendCmd::GoBack
             | BackendCmd::RefreshDevices
             | BackendCmd::SelectAudioDevice { .. }
-            | BackendCmd::SetExclusiveMode { .. } => {}
+            | BackendCmd::SetExclusiveMode { .. }
+            | BackendCmd::DownloadAlbum
+            | BackendCmd::PlayDetail
+            | BackendCmd::DownloadDetail => {}
         }
     }
 }
@@ -382,6 +439,14 @@ struct AuthedState {
     /// id back to a human label and to drive the auto-pick of the
     /// first bitperfect device on a fresh install.
     audio_devices: Arc<Mutex<Vec<AudioDevice>>>,
+    /// Album currently displayed in the tracklist (used by the
+    /// download task to decide whether to push progress updates to the
+    /// UI — if the user navigated away, the task keeps writing files
+    /// but stops touching the window).
+    current_album_id: Arc<Mutex<Option<String>>>,
+    /// Cancel flag for the in-flight download. Replaced on each new
+    /// click; the previous Arc gets dropped after we flip it true.
+    download_cancel: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 impl AuthedState {
@@ -401,6 +466,8 @@ impl AuthedState {
             audio: AudioEngine::new(),
             storage,
             audio_devices: Arc::new(Mutex::new(Vec::new())),
+            current_album_id: Arc::new(Mutex::new(None)),
+            download_cancel: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -431,6 +498,7 @@ async fn run_authed(
                     title: view_title(&collection_type),
                     subtitle: String::new(),
                     children: ChildrenType::LibraryRoot { collection_type },
+                    album_artist: None,
                 });
                 fetch_and_render(&state, &nav, &mut current_items).await;
             }
@@ -455,7 +523,11 @@ async fn run_authed(
                 spawn_device_refresh(&state, /* auto_pick = */ false);
             }
             BackendCmd::SelectAudioDevice { id } => {
-                let id_opt = if id.is_empty() { None } else { Some(id.as_str()) };
+                let id_opt = if id.is_empty() {
+                    None
+                } else {
+                    Some(id.as_str())
+                };
                 if let Err(e) = storage.set_audio_device(id_opt) {
                     error!(?e, "persist audio device failed");
                 }
@@ -467,6 +539,18 @@ async fn run_authed(
                     error!(?e, "persist exclusive mode failed");
                 }
                 set_exclusive_mode(&state.weak, value);
+            }
+            BackendCmd::DownloadAlbum => {
+                start_album_download(&state, nav.last(), &current_items);
+            }
+            BackendCmd::PlayDetail => match nav.last() {
+                Some(top) if matches!(top.children, ChildrenType::MovieDetail) => {
+                    play_video(&state, &top.parent_id);
+                }
+                _ => warn!("play-detail with no playable detail on top of nav"),
+            },
+            BackendCmd::DownloadDetail => {
+                info!("video download from detail page not implemented yet");
             }
             BackendCmd::SignIn { .. } => warn!("sign-in while authed; ignoring"),
         }
@@ -482,6 +566,7 @@ fn library_root_entry(view: &BaseItemDto) -> NavEntry {
         children: ChildrenType::LibraryRoot {
             collection_type: ct,
         },
+        album_artist: None,
     }
 }
 
@@ -495,15 +580,30 @@ async fn activate(
     item_type: &str,
 ) {
     match item_type {
-        "Movie" | "Episode" | "Video" => {
-            let Some(token) = state.client.token() else {
-                warn!("no token; cannot play");
-                return;
-            };
-            let url = video_stream_url(state.client.base_url(), item_id, token);
-            let audio_device = state.storage.audio_device().ok().flatten();
-            info!(%url, kind = item_type, ?audio_device, "play video");
-            video_engine::play(url.to_string(), audio_device);
+        // Episodes still play on click; movies/series open a detail
+        // page first (Reproducir plays from there).
+        "Episode" | "Video" => {
+            play_video(state, item_id);
+        }
+        "Movie" => {
+            open_detail(
+                state,
+                nav,
+                current_items,
+                item_id,
+                /* is_series = */ false,
+            )
+            .await;
+        }
+        "Series" => {
+            open_detail(
+                state,
+                nav,
+                current_items,
+                item_id,
+                /* is_series = */ true,
+            )
+            .await;
         }
         "Audio" => {
             let Some(token) = state.client.token() else {
@@ -524,14 +624,13 @@ async fn activate(
                 .audio
                 .play_track(url.to_string(), container, audio_device, exclusive);
         }
-        "MusicAlbum" | "Series" | "Season" | "Playlist" => {
+        "MusicAlbum" | "Season" | "Playlist" => {
             let Some(item) = current_items.iter().find(|i| i.id == item_id).cloned() else {
                 warn!(item_id, "activate target not in current_items");
                 return;
             };
             let children = match item_type {
                 "MusicAlbum" => ChildrenType::Tracks,
-                "Series" => ChildrenType::Seasons,
                 "Season" => ChildrenType::Episodes,
                 "Playlist" => ChildrenType::PlaylistItems,
                 _ => unreachable!(),
@@ -550,12 +649,48 @@ async fn activate(
                 title: item.name.clone().unwrap_or_default(),
                 subtitle: detail_subtitle(&item, item_type),
                 children,
+                album_artist: if is_album {
+                    Some(item.album_artist.clone().unwrap_or_default())
+                } else {
+                    None
+                },
             });
+            if is_album {
+                *state.current_album_id.lock().unwrap() = Some(item.id.clone());
+                reset_album_download_ui(&state.weak);
+            } else {
+                *state.current_album_id.lock().unwrap() = None;
+            }
             fetch_and_render(state, nav, current_items).await;
             // Cover load uses the post-fetch epoch so a quick back-out
             // cancels it cleanly via the epoch guard.
             if let Some(tag) = cover_tag {
-                spawn_album_cover_fetch(state, item.id, tag);
+                spawn_album_cover_fetch(state, item.id.clone(), tag);
+            }
+            if is_album {
+                // Jellyfin's listing endpoint sometimes ships a thin
+                // version of each item (Overview/ProductionYear can be
+                // dropped even when they're in `fields`). Refetch the
+                // single item to get the full record — small request,
+                // and it's the standard pattern for album detail.
+                let full = match state.client.item(&state.user_id, &item.id).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!(?e, album = %item.id, "item refetch failed; using listing copy");
+                        item.clone()
+                    }
+                };
+                debug!(
+                    year = ?full.production_year,
+                    has_overview = full.overview.is_some(),
+                    n_genres = full.genres.as_ref().map(|g| g.len()).unwrap_or(0),
+                    "album detail"
+                );
+                let (meta_line, genres) = album_header_strings(&full, current_items);
+                let artist = full.album_artist.clone().unwrap_or_default();
+                let overview = full.overview.clone().unwrap_or_default();
+                let wiki = extract_wikipedia_url(&overview);
+                set_album_meta(&state.weak, artist, meta_line, genres, overview, wiki);
             }
         }
         other => {
@@ -580,6 +715,348 @@ fn detail_subtitle(item: &BaseItemDto, item_type: &str) -> String {
             .map(|c| format!("{c} episodes"))
             .unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+/// Direct-play a movie/episode by id (Reproducir, or an episode click).
+fn play_video(state: &AuthedState, item_id: &str) {
+    let Some(token) = state.client.token() else {
+        warn!("no token; cannot play");
+        return;
+    };
+    let url = video_stream_url(state.client.base_url(), item_id, token);
+    let audio_device = state.storage.audio_device().ok().flatten();
+    info!(%url, ?audio_device, "play video");
+    video_engine::play(url.to_string(), audio_device);
+}
+
+/// Push a movie/series detail page onto the nav stack. For a series we
+/// also fetch its seasons (rendered under the metadata); a movie has no
+/// children. The thin listing copy is replaced by a full single-item
+/// refetch for the rich metadata, then images stream in.
+async fn open_detail(
+    state: &AuthedState,
+    nav: &mut Vec<NavEntry>,
+    current_items: &mut Vec<BaseItemDto>,
+    item_id: &str,
+    is_series: bool,
+) {
+    let Some(item) = current_items.iter().find(|i| i.id == item_id).cloned() else {
+        warn!(item_id, "detail target not in current_items");
+        return;
+    };
+    nav.push(NavEntry {
+        parent_id: item.id.clone(),
+        title: item.name.clone().unwrap_or_default(),
+        subtitle: String::new(),
+        children: if is_series {
+            ChildrenType::SeriesDetail
+        } else {
+            ChildrenType::MovieDetail
+        },
+        album_artist: None,
+    });
+    *state.current_album_id.lock().unwrap() = None;
+    // Flips view-mode to "detail"; fetches seasons for a series, no-op
+    // children for a movie.
+    fetch_and_render(state, nav, current_items).await;
+    let full = match state.client.item(&state.user_id, &item.id).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(?e, id = %item.id, "detail refetch failed; using listing copy");
+            item.clone()
+        }
+    };
+    apply_detail(state, &full, is_series);
+}
+
+/// Build every detail-page string/model from a full item record, push
+/// them to the UI, then spawn the backdrop + cast-photo loads.
+fn apply_detail(state: &AuthedState, item: &BaseItemDto, is_series: bool) {
+    let actors: Vec<PersonInfo> = item
+        .people
+        .as_ref()
+        .map(|ps| {
+            ps.iter()
+                .filter(|p| p.person_type.as_deref() == Some("Actor"))
+                .take(24)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let cast: Vec<(String, String)> = actors
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone().unwrap_or_default(),
+                p.role.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let (imdb_url, tmdb_url) = provider_urls(item, is_series);
+    let premiere = item
+        .premiere_date
+        .as_deref()
+        .and_then(format_premiere_date)
+        .map(|d| format!("Estreno: {d}"))
+        .unwrap_or_default();
+    let country = item
+        .production_locations
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("País: {}", v.join(", ")))
+        .unwrap_or_default();
+    let studios = item
+        .studios
+        .as_ref()
+        .map(|s| s.iter().filter_map(|x| x.name.clone()).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .map(|v| format!("Estudios: {}", v.join(", ")))
+        .unwrap_or_default();
+
+    set_detail_meta(
+        &state.weak,
+        DetailMeta {
+            meta: detail_meta_line(item),
+            tagline: item
+                .taglines
+                .as_ref()
+                .and_then(|t| t.first())
+                .cloned()
+                .unwrap_or_default(),
+            overview: item.overview.clone().unwrap_or_default(),
+            director: people_line(item, "Director", "Director"),
+            writers: people_line(item, "Writer", "Guionistas"),
+            genres: item.genres.clone().unwrap_or_default(),
+            cast,
+            premiere,
+            country,
+            studios,
+            tags: item.tags.clone().unwrap_or_default(),
+            media_info: build_media_info(item),
+            imdb_url,
+            tmdb_url,
+            can_play: !is_series,
+            children_label: if is_series {
+                "Temporadas".to_string()
+            } else {
+                String::new()
+            },
+        },
+    );
+
+    if let Some(tag) = item
+        .backdrop_image_tags
+        .as_ref()
+        .and_then(|v| v.first())
+        .cloned()
+    {
+        spawn_backdrop_fetch(state, item.id.clone(), tag);
+    }
+    for (i, p) in actors.iter().enumerate() {
+        if let (Some(id), Some(tag)) = (p.id.clone(), p.primary_image_tag.clone()) {
+            spawn_cast_fetch(state, i, id, tag);
+        }
+    }
+}
+
+/// "2008 · 1h 42m · PG-13 · ★ 5.1 · 🍅 9%" — only the parts present.
+fn detail_meta_line(item: &BaseItemDto) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(y) = item.production_year {
+        parts.push(y.to_string());
+    }
+    if let Some(t) = item.run_time_ticks.filter(|t| *t > 0) {
+        parts.push(format_runtime(t));
+    }
+    if let Some(r) = item.official_rating.clone().filter(|s| !s.is_empty()) {
+        parts.push(r);
+    }
+    if let Some(c) = item.community_rating {
+        parts.push(format!("★ {c:.1}"));
+    }
+    if let Some(cr) = item.critic_rating {
+        parts.push(format!("🍅 {}%", cr.round() as i64));
+    }
+    parts.join("  ·  ")
+}
+
+/// Runtime ticks → "1h 42m" / "42m".
+fn format_runtime(ticks: i64) -> String {
+    let total = ticks_to_seconds(ticks).round() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// "Director: A, B" / "Guionistas: A, B" from the people list, filtered
+/// by Jellyfin person type. Empty when nobody matches.
+fn people_line(item: &BaseItemDto, person_type: &str, label: &str) -> String {
+    let names: Vec<String> = item
+        .people
+        .as_ref()
+        .map(|ps| {
+            ps.iter()
+                .filter(|p| p.person_type.as_deref() == Some(person_type))
+                .filter_map(|p| p.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: {}", names.join(", "))
+    }
+}
+
+/// External-link URLs from `ProviderIds`. Keys are matched case-
+/// insensitively ("Imdb"/"Tmdb"). Empty string when absent.
+fn provider_urls(item: &BaseItemDto, is_series: bool) -> (String, String) {
+    let Some(ids) = item.provider_ids.as_ref() else {
+        return (String::new(), String::new());
+    };
+    let get = |key: &str| {
+        ids.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty())
+    };
+    let imdb = get("Imdb")
+        .map(|id| format!("https://www.imdb.com/title/{id}/"))
+        .unwrap_or_default();
+    let tmdb = get("Tmdb")
+        .map(|id| {
+            let kind = if is_series { "tv" } else { "movie" };
+            format!("https://www.themoviedb.org/{kind}/{id}")
+        })
+        .unwrap_or_default();
+    (imdb, tmdb)
+}
+
+/// ISO date ("2008-03-04T…") → "4 de marzo de 2008". None if unparseable.
+fn format_premiere_date(iso: &str) -> Option<String> {
+    let date = iso.split('T').next()?;
+    let mut it = date.split('-');
+    let y: i32 = it.next()?.parse().ok()?;
+    let mo: usize = it.next()?.parse().ok()?;
+    let d: u32 = it.next()?.parse().ok()?;
+    const MESES: [&str; 12] = [
+        "enero",
+        "febrero",
+        "marzo",
+        "abril",
+        "mayo",
+        "junio",
+        "julio",
+        "agosto",
+        "septiembre",
+        "octubre",
+        "noviembre",
+        "diciembre",
+    ];
+    let mes = MESES.get(mo.checked_sub(1)?)?;
+    Some(format!("{d} de {mes} de {y}"))
+}
+
+/// "Información del medio" chips: resolution, video codec, HDR range,
+/// each audio track (codec/channels/lang), container, bitrate.
+fn build_media_info(item: &BaseItemDto) -> Vec<String> {
+    let source = item.media_sources.as_ref().and_then(|m| m.first());
+    let streams: &[MediaStream] = item
+        .media_streams
+        .as_deref()
+        .or_else(|| source.and_then(|s| s.media_streams.as_deref()))
+        .unwrap_or(&[]);
+
+    let mut out: Vec<String> = Vec::new();
+    if let Some(v) = streams
+        .iter()
+        .find(|s| s.stream_type.as_deref() == Some("Video"))
+    {
+        if let Some(h) = v.height {
+            out.push(resolution_label(h));
+        }
+        if let Some(c) = v.codec.as_deref() {
+            out.push(video_codec_label(c));
+        }
+        if let Some(r) = v
+            .video_range
+            .as_deref()
+            .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("SDR"))
+        {
+            out.push(r.to_uppercase());
+        }
+    }
+    for a in streams
+        .iter()
+        .filter(|s| s.stream_type.as_deref() == Some("Audio"))
+    {
+        out.push(audio_label(a));
+    }
+    if let Some(c) = source
+        .and_then(|s| s.container.as_deref())
+        .filter(|c| !c.is_empty())
+    {
+        out.push(c.to_uppercase());
+    }
+    if let Some(b) = source.and_then(|s| s.bitrate).filter(|b| *b > 0) {
+        out.push(format!("{:.1} Mbps", b as f64 / 1_000_000.0));
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+fn resolution_label(h: i32) -> String {
+    match h {
+        x if x >= 2000 => "4K".into(),
+        x if x >= 1400 => "1440p".into(),
+        x if x >= 1000 => "1080p".into(),
+        x if x >= 700 => "720p".into(),
+        x if x >= 540 => "576p".into(),
+        x if x > 0 => format!("{x}p"),
+        _ => String::new(),
+    }
+}
+
+fn video_codec_label(c: &str) -> String {
+    match c.to_ascii_lowercase().as_str() {
+        "hevc" | "h265" => "HEVC".into(),
+        "h264" | "avc" => "H.264".into(),
+        "av1" => "AV1".into(),
+        "vp9" => "VP9".into(),
+        "mpeg2video" => "MPEG-2".into(),
+        other => other.to_uppercase(),
+    }
+}
+
+fn audio_label(a: &MediaStream) -> String {
+    let codec = a.codec.as_deref().unwrap_or("").to_uppercase();
+    let ch = a.channels.map(channel_label).unwrap_or_default();
+    let lang = a
+        .language
+        .as_deref()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_uppercase())
+        .unwrap_or_default();
+    [codec, ch, lang]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn channel_label(ch: i32) -> String {
+    match ch {
+        1 => "Mono".into(),
+        2 => "2.0".into(),
+        6 => "5.1".into(),
+        8 => "7.1".into(),
+        n => format!("{n}ch"),
     }
 }
 
@@ -614,6 +1091,25 @@ async fn fetch_and_render(
     // else. The cover load below (when entering an album) repopulates.
     if !matches!(top.children, ChildrenType::Tracks) {
         clear_album_image(&state.weak);
+        *state.current_album_id.lock().unwrap() = None;
+    }
+    // Detail props are stale the moment we leave a detail page; wiping
+    // them here avoids the previous movie's backdrop/overview flashing
+    // before apply_detail repopulates (after the single-item refetch).
+    clear_detail(&state.weak);
+    // A movie has no children to list — skip the items query entirely
+    // and let apply_detail fill the page.
+    if matches!(top.children, ChildrenType::MovieDetail) {
+        *current_items = Vec::new();
+        set_view_meta(
+            &state.weak,
+            top.title.clone(),
+            String::new(),
+            top.children.collection_label().into(),
+            "detail".into(),
+        );
+        set_loading(&state.weak, false);
+        return;
     }
 
     let resp = match state
@@ -648,7 +1144,11 @@ async fn fetch_and_render(
     } else {
         format!("{} items", resp.items.len())
     };
-    let header_subtitle = if top.subtitle.is_empty() {
+    // The series detail page shows its own meta row; don't tack a
+    // "N items" count onto the nav subtitle there.
+    let header_subtitle = if matches!(top.children, ChildrenType::SeriesDetail) {
+        top.subtitle.clone()
+    } else if top.subtitle.is_empty() {
         count_label
     } else {
         format!("{} · {}", top.subtitle, count_label)
@@ -785,7 +1285,12 @@ async fn fetch_image(http: &reqwest::Client, url: &Url) -> Result<(Vec<u8>, u32,
 /// shows the id-as-label until [`spawn_device_refresh`] resolves a
 /// real description.
 fn push_initial_audio_state(state: &AuthedState) {
-    let id = state.storage.audio_device().ok().flatten().unwrap_or_default();
+    let id = state
+        .storage
+        .audio_device()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let exclusive = state.storage.exclusive_mode().unwrap_or(true);
     let label = if id.is_empty() {
         "System default".to_string()
@@ -823,7 +1328,8 @@ fn spawn_device_refresh(state: &AuthedState, auto_pick: bool) {
 
         // Auto-pick on first launch only.
         let mut selected_id = storage.audio_device().ok().flatten().unwrap_or_default();
-        if auto_pick && selected_id.is_empty()
+        if auto_pick
+            && selected_id.is_empty()
             && let Some(first) = devices.iter().find(|d| d.bitperfect)
         {
             if let Err(e) = storage.set_audio_device(Some(&first.id)) {
@@ -871,6 +1377,9 @@ struct ItemData {
     subtitle: String,
     item_type: String,
     track_index: i32,
+    /// Per-track technical badge for audio rows (e.g. "DSD64",
+    /// "FLAC 24/96"); empty for everything else.
+    tech: String,
 }
 
 /// Build the UI-side row for a Jellyfin item. Subtitle and visible
@@ -906,13 +1415,77 @@ fn build_initial_item_data(item: &BaseItemDto) -> ItemData {
             .unwrap_or_default(),
         _ => String::new(),
     };
+    let tech = if item_type == "Audio" {
+        track_tech(item)
+    } else {
+        String::new()
+    };
     ItemData {
         id: item.id.clone(),
         title,
         subtitle,
         item_type,
         track_index: item.index_number.unwrap_or(0),
+        tech,
     }
+}
+
+/// Compact technical badge for an audio track, sourced from its audio
+/// MediaStream: DSD streams show their rate as "DSD64/128/…", PCM/
+/// lossless show "<CODEC> <bitDepth>/<kHz>" (e.g. "FLAC 24/96"). Empty
+/// when no usable stream metadata is present.
+fn track_tech(item: &BaseItemDto) -> String {
+    let streams = item.media_streams.as_ref().or_else(|| {
+        item.media_sources
+            .as_ref()
+            .and_then(|m| m.first())
+            .and_then(|s| s.media_streams.as_ref())
+    });
+    let Some(audio) = streams.and_then(|s| {
+        s.iter()
+            .find(|st| st.stream_type.as_deref() == Some("Audio"))
+    }) else {
+        return String::new();
+    };
+
+    let codec = audio.codec.as_deref().unwrap_or("");
+    let sample_rate = audio.sample_rate.unwrap_or(0);
+    let codec_upper = codec.to_ascii_uppercase();
+
+    // DSD: the "sample rate" is the 1-bit rate; express it as the
+    // familiar DSDxx multiple of the 44.1 kHz CD base (2.8224 MHz = 64).
+    if codec_upper.contains("DSD") || codec_upper.contains("DST") {
+        if sample_rate > 0 {
+            let multiple = (sample_rate as f64 / 44_100.0).round() as i64;
+            return format!("DSD{multiple}");
+        }
+        return "DSD".to_string();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !codec.is_empty() {
+        parts.push(codec_upper);
+    }
+    if let Some(depth) = audio.bit_depth
+        && sample_rate > 0
+    {
+        let khz = sample_rate as f64 / 1000.0;
+        let khz_str = if khz.fract() == 0.0 {
+            format!("{khz:.0}")
+        } else {
+            format!("{khz:.1}")
+        };
+        parts.push(format!("{depth}/{khz_str}"));
+    } else if sample_rate > 0 {
+        let khz = sample_rate as f64 / 1000.0;
+        let khz_str = if khz.fract() == 0.0 {
+            format!("{khz:.0}")
+        } else {
+            format!("{khz:.1}")
+        };
+        parts.push(format!("{khz_str} kHz"));
+    }
+    parts.join(" ")
 }
 
 fn item_type_str(t: &Option<ItemType>) -> String {
@@ -1055,6 +1628,7 @@ fn set_items(weak: &slint::Weak<MainWindow>, items: Vec<ItemData>) {
                     has_image: false,
                     item_type: SharedString::from(d.item_type),
                     track_index: d.track_index,
+                    tech: SharedString::from(d.tech),
                 })
                 .collect();
             w.set_items(ModelRc::new(VecModel::from(slint_items)));
@@ -1116,6 +1690,223 @@ fn set_album_image(
     });
 }
 
+// ---------------------------------------------------------------- detail page
+
+/// Everything the detail page needs as ready-to-display strings. Built
+/// on the backend thread by [`apply_detail`]; pushed to Slint by
+/// [`set_detail_meta`]. Cast images are filled in afterwards by index.
+struct DetailMeta {
+    meta: String,
+    tagline: String,
+    overview: String,
+    director: String,
+    writers: String,
+    genres: Vec<String>,
+    cast: Vec<(String, String)>,
+    premiere: String,
+    country: String,
+    studios: String,
+    tags: Vec<String>,
+    media_info: Vec<String>,
+    imdb_url: String,
+    tmdb_url: String,
+    can_play: bool,
+    children_label: String,
+}
+
+fn string_model(v: Vec<String>) -> ModelRc<SharedString> {
+    let s: Vec<SharedString> = v.into_iter().map(SharedString::from).collect();
+    ModelRc::new(VecModel::from(s))
+}
+
+fn set_detail_meta(weak: &slint::Weak<MainWindow>, d: DetailMeta) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        w.set_detail_meta(SharedString::from(d.meta));
+        w.set_detail_tagline(SharedString::from(d.tagline));
+        w.set_detail_overview(SharedString::from(d.overview));
+        w.set_detail_director(SharedString::from(d.director));
+        w.set_detail_writers(SharedString::from(d.writers));
+        w.set_detail_genres(string_model(d.genres));
+        let cast: Vec<CastMember> = d
+            .cast
+            .into_iter()
+            .map(|(name, character)| CastMember {
+                name: SharedString::from(name),
+                character: SharedString::from(character),
+                image: slint::Image::default(),
+                has_image: false,
+            })
+            .collect();
+        w.set_detail_cast(ModelRc::new(VecModel::from(cast)));
+        w.set_detail_premiere(SharedString::from(d.premiere));
+        w.set_detail_country(SharedString::from(d.country));
+        w.set_detail_studios(SharedString::from(d.studios));
+        w.set_detail_tags(string_model(d.tags));
+        w.set_detail_media_info(string_model(d.media_info));
+        w.set_detail_imdb_url(SharedString::from(d.imdb_url));
+        w.set_detail_tmdb_url(SharedString::from(d.tmdb_url));
+        w.set_detail_can_play(d.can_play);
+        w.set_detail_children_label(SharedString::from(d.children_label));
+    });
+}
+
+fn clear_detail(weak: &slint::Weak<MainWindow>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        w.set_detail_has_backdrop(false);
+        w.set_detail_backdrop(slint::Image::default());
+        w.set_detail_meta(SharedString::new());
+        w.set_detail_tagline(SharedString::new());
+        w.set_detail_overview(SharedString::new());
+        w.set_detail_director(SharedString::new());
+        w.set_detail_writers(SharedString::new());
+        w.set_detail_genres(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+        w.set_detail_cast(ModelRc::new(VecModel::from(Vec::<CastMember>::new())));
+        w.set_detail_premiere(SharedString::new());
+        w.set_detail_country(SharedString::new());
+        w.set_detail_studios(SharedString::new());
+        w.set_detail_tags(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+        w.set_detail_media_info(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+        w.set_detail_imdb_url(SharedString::new());
+        w.set_detail_tmdb_url(SharedString::new());
+        w.set_detail_can_play(false);
+        w.set_detail_children_label(SharedString::new());
+    });
+}
+
+fn set_detail_backdrop(
+    weak: &slint::Weak<MainWindow>,
+    epoch_ref: Arc<AtomicU64>,
+    expected_epoch: u64,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if epoch_ref.load(Ordering::SeqCst) != expected_epoch {
+            return;
+        }
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        let mut buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        w.set_detail_backdrop(slint::Image::from_rgba8(buffer));
+        w.set_detail_has_backdrop(true);
+    });
+}
+
+fn push_cast_image(
+    weak: &slint::Weak<MainWindow>,
+    epoch_ref: Arc<AtomicU64>,
+    expected_epoch: u64,
+    index: usize,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if epoch_ref.load(Ordering::SeqCst) != expected_epoch {
+            return;
+        }
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        let model = w.get_detail_cast();
+        let Some(mut member) = model.row_data(index) else {
+            return;
+        };
+        let mut buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        member.image = slint::Image::from_rgba8(buffer);
+        member.has_image = true;
+        model.set_row_data(index, member);
+    });
+}
+
+fn spawn_backdrop_fetch(state: &AuthedState, item_id: String, tag: String) {
+    let weak = state.weak.clone();
+    let http = state.image_http.clone();
+    let sem = state.image_sem.clone();
+    let epoch_ref = state.epoch.clone();
+    let expected = epoch_ref.load(Ordering::SeqCst);
+    let base = state.client.base_url().clone();
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if epoch_ref.load(Ordering::SeqCst) != expected {
+            return;
+        }
+        let url = image_url(
+            &base,
+            &item_id,
+            ApiImageType::Backdrop,
+            &ImageOptions {
+                tag: Some(tag),
+                fill_width: Some(1280),
+                quality: Some(90),
+                ..Default::default()
+            },
+        );
+        match fetch_image(&http, &url).await {
+            Ok((rgba, w, h)) => {
+                if epoch_ref.load(Ordering::SeqCst) == expected {
+                    set_detail_backdrop(&weak, epoch_ref.clone(), expected, rgba, w, h);
+                }
+            }
+            Err(e) => debug!(?e, %url, "backdrop fetch failed"),
+        }
+    });
+}
+
+fn spawn_cast_fetch(state: &AuthedState, index: usize, person_id: String, tag: String) {
+    let weak = state.weak.clone();
+    let http = state.image_http.clone();
+    let sem = state.image_sem.clone();
+    let epoch_ref = state.epoch.clone();
+    let expected = epoch_ref.load(Ordering::SeqCst);
+    let base = state.client.base_url().clone();
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if epoch_ref.load(Ordering::SeqCst) != expected {
+            return;
+        }
+        let url = image_url(
+            &base,
+            &person_id,
+            ApiImageType::Primary,
+            &ImageOptions {
+                tag: Some(tag),
+                fill_height: Some(200),
+                quality: Some(90),
+                ..Default::default()
+            },
+        );
+        match fetch_image(&http, &url).await {
+            Ok((rgba, w, h)) => {
+                if epoch_ref.load(Ordering::SeqCst) == expected {
+                    push_cast_image(&weak, epoch_ref.clone(), expected, index, rgba, w, h);
+                }
+            }
+            Err(e) => debug!(?e, %url, "cast image fetch failed"),
+        }
+    });
+}
+
 fn set_audio_devices(weak: &slint::Weak<MainWindow>, devices: Vec<AudioDevice>) {
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -1169,6 +1960,435 @@ fn clear_album_image(weak: &slint::Weak<MainWindow>) {
         if let Some(w) = weak.upgrade() {
             w.set_album_image(slint::Image::default());
             w.set_album_has_image(false);
+            w.set_album_artist(SharedString::new());
+            w.set_album_meta(SharedString::new());
+            w.set_album_genres(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+            w.set_album_overview(SharedString::new());
+            w.set_album_wikipedia_url(SharedString::new());
+        }
+    });
+}
+
+fn set_album_meta(
+    weak: &slint::Weak<MainWindow>,
+    artist: String,
+    meta: String,
+    genres: Vec<String>,
+    overview: String,
+    wikipedia_url: Option<String>,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_album_artist(SharedString::from(artist));
+            w.set_album_meta(SharedString::from(meta));
+            let chips: Vec<SharedString> = genres.into_iter().map(SharedString::from).collect();
+            w.set_album_genres(ModelRc::new(VecModel::from(chips)));
+            w.set_album_overview(SharedString::from(overview));
+            w.set_album_wikipedia_url(SharedString::from(wikipedia_url.unwrap_or_default()));
+        }
+    });
+}
+
+/// Build the meta line ("2023 · 12 pistas · 45:32") and the genre list
+/// from the album item + its already-fetched tracks. Genres come off the
+/// album itself; track count + total duration are summed from `tracks`.
+fn album_header_strings(album: &BaseItemDto, tracks: &[BaseItemDto]) -> (String, Vec<String>) {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(y) = album.production_year {
+        parts.push(y.to_string());
+    }
+    let n = tracks.len();
+    if n > 0 {
+        parts.push(format!("{n} pista{}", if n == 1 { "" } else { "s" }));
+    }
+    let total_ticks: i64 = tracks
+        .iter()
+        .filter_map(|t| t.run_time_ticks)
+        .filter(|t| *t > 0)
+        .sum();
+    if total_ticks > 0 {
+        parts.push(format_ticks_long(total_ticks));
+    }
+    let meta = parts.join(" · ");
+    let genres = album.genres.clone().unwrap_or_default();
+    (meta, genres)
+}
+
+/// Scan `overview` for the first Wikipedia article URL. Jellyfin's
+/// metadata providers often dump links into the overview text (esp.
+/// TheAudioDB), so we don't need fancy parsing — just grab the URL
+/// substring up to the first whitespace / closing bracket.
+fn extract_wikipedia_url(overview: &str) -> Option<String> {
+    for marker in ["https://", "http://"] {
+        let mut search = overview;
+        while let Some(start) = search.find(marker) {
+            let candidate = &search[start..];
+            let end = candidate
+                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | ')' | ']'))
+                .unwrap_or(candidate.len());
+            let url = &candidate[..end];
+            if url.contains("wikipedia.org/wiki/") {
+                return Some(url.trim_end_matches(['.', ',', ';', ':']).to_string());
+            }
+            search = &candidate[marker.len()..];
+        }
+    }
+    None
+}
+
+/// Hand off to the OS's default URL opener. Avoids pulling in the
+/// `open` crate for a 6-line wrapper. macOS uses `open`, Linux uses
+/// `xdg-open`; both background by default so we don't block.
+fn open_external_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(target_os = "linux")]
+    let prog = "xdg-open";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let prog = "";
+    if prog.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no URL opener on this platform",
+        ));
+    }
+    std::process::Command::new(prog)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
+/// Long form for album totals: H:MM:SS over an hour, M:SS otherwise.
+/// Different from the per-track formatter which is always M:SS.
+fn format_ticks_long(ticks: i64) -> String {
+    // Jellyfin ticks: 10,000,000 per second.
+    let total_secs = (ticks / 10_000_000).max(0) as u64;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+// ---------------------------------------------------------------- album download
+
+/// Kick off (or replace) the download for the album currently on screen.
+///
+/// Called on the backend thread holding `current_items`. We snapshot
+/// the tracks into a thread-safe struct, spawn a tokio task that runs
+/// the actual fetch loop, and stash the cancel flag on `state` so a
+/// subsequent click on a different album can cancel this one cleanly.
+fn start_album_download(
+    state: &AuthedState,
+    top: Option<&NavEntry>,
+    current_items: &[BaseItemDto],
+) {
+    let Some(top) = top else {
+        warn!("download requested with empty nav");
+        return;
+    };
+    if !matches!(top.children, ChildrenType::Tracks) {
+        warn!("download requested outside an album view");
+        return;
+    }
+    let album_id = top.parent_id.clone();
+    let album_name = top.title.clone();
+    let artist = top
+        .album_artist
+        .clone()
+        .unwrap_or_else(|| "Unknown Artist".to_string());
+
+    // Cancel any in-flight download from a previous album. New token
+    // for this run; we hold one Arc, the task holds the other.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut slot = state.download_cancel.lock().unwrap();
+        if let Some(prev) = slot.take() {
+            prev.store(true, Ordering::SeqCst);
+        }
+        *slot = Some(cancel.clone());
+    }
+
+    let tracks: Vec<DownloadTrack> = current_items
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let source = t.media_sources.as_ref().and_then(|m| m.first());
+            DownloadTrack {
+                id: t.id.clone(),
+                order: i + 1,
+                track_index: t.index_number,
+                title: t.name.clone().unwrap_or_else(|| format!("Track {}", i + 1)),
+                extension: pick_extension(
+                    source.and_then(|s| s.path.as_deref()),
+                    source.and_then(|s| s.container.as_deref()),
+                ),
+            }
+        })
+        .collect();
+    if tracks.is_empty() {
+        warn!(album = %album_id, "no tracks to download");
+        return;
+    }
+
+    let Some(token) = state.client.token().map(|s| s.to_string()) else {
+        warn!("no token; cannot download");
+        return;
+    };
+    let base = state.client.base_url().clone();
+    let weak = state.weak.clone();
+    let current_album_id = state.current_album_id.clone();
+
+    // Lock the button right away. The task will keep updating the
+    // label as each track completes.
+    push_download_status(
+        &weak,
+        &current_album_id,
+        &album_id,
+        format!("Descargando 0/{}…", tracks.len()),
+        /* enabled = */ false,
+        /* active = */ true,
+    );
+
+    tokio::spawn(async move {
+        let result = run_album_download(
+            base,
+            token,
+            artist.clone(),
+            album_name.clone(),
+            tracks.clone(),
+            cancel.clone(),
+            &weak,
+            &current_album_id,
+            &album_id,
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                push_download_status(
+                    &weak,
+                    &current_album_id,
+                    &album_id,
+                    "✓ Descargado".to_string(),
+                    false,
+                    false,
+                );
+            }
+            Err(e) if cancel.load(Ordering::SeqCst) => {
+                debug!(?e, "download cancelled");
+            }
+            Err(e) => {
+                error!(?e, album = %album_id, "album download failed");
+                push_download_status(
+                    &weak,
+                    &current_album_id,
+                    &album_id,
+                    "Error — reintentar".to_string(),
+                    true,
+                    false,
+                );
+            }
+        }
+    });
+}
+
+#[derive(Clone)]
+struct DownloadTrack {
+    id: String,
+    /// 1-based position in the album's track listing.
+    order: usize,
+    track_index: Option<i32>,
+    title: String,
+    /// File extension already resolved — "flac", "m4a", "wav", "dsf",
+    /// "mp3". Preferred from `MediaSourceInfo.path` (most accurate),
+    /// falling back to `container` and then a sane default.
+    extension: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_album_download(
+    base: Url,
+    token: String,
+    artist: String,
+    album_name: String,
+    tracks: Vec<DownloadTrack>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    weak: &slint::Weak<MainWindow>,
+    current_album_id: &Arc<Mutex<Option<String>>>,
+    album_id: &str,
+) -> Result<()> {
+    let dir = album_download_dir(&artist, &album_name)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create dir {}", dir.display()))?;
+    info!(dir = %dir.display(), tracks = tracks.len(), "starting album download");
+
+    let total = tracks.len();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("build http client")?;
+
+    for (i, t) in tracks.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("cancelled"));
+        }
+        let filename = format!(
+            "{:02} - {}.{}",
+            t.track_index.map(|n| n as usize).unwrap_or(t.order),
+            sanitize_path_component(&t.title),
+            t.extension
+        );
+        let dest = dir.join(filename);
+        let url = audio_stream_url(&base, &t.id, &token);
+
+        debug!(track = %t.title, %url, dest = %dest.display(), "downloading");
+        let resp = http.get(url).send().await?.error_for_status()?;
+        let bytes = resp.bytes().await?;
+        tokio::task::spawn_blocking({
+            let dest = dest.clone();
+            let bytes = bytes.clone();
+            move || std::fs::write(&dest, &bytes)
+        })
+        .await
+        .context("write task join")??;
+
+        push_download_status(
+            weak,
+            current_album_id,
+            album_id,
+            format!("Descargando {}/{}…", i + 1, total),
+            false,
+            true,
+        );
+    }
+    Ok(())
+}
+
+/// `~/Music/Jelly/<artist>/<album>/`. The `directories` crate already
+/// hands us `audio_dir` cross-platform (`$XDG_MUSIC_DIR` or `~/Music`
+/// on Linux, `~/Music` on macOS). Falls back to `$HOME/Music` if the
+/// crate can't resolve user dirs.
+fn album_download_dir(artist: &str, album: &str) -> Result<std::path::PathBuf> {
+    let music = directories::UserDirs::new()
+        .and_then(|d| d.audio_dir().map(|p| p.to_path_buf()))
+        .or_else(dirs_fallback)
+        .ok_or_else(|| anyhow::anyhow!("no user music dir"))?;
+    Ok(music
+        .join("Jelly")
+        .join(sanitize_path_component(artist))
+        .join(sanitize_path_component(album)))
+}
+
+fn dirs_fallback() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Music"))
+}
+
+/// Strip path separators, control chars, and other characters that
+/// confuse Finder/Nautilus or break shells. Keeps the name readable;
+/// not a security boundary. Quotes are *removed* rather than mapped
+/// to `_` so that `"Heroes"` ends up as `Heroes` instead of `_Heroes_`.
+fn sanitize_path_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter_map(|c| match c {
+            '"' => None,
+            '/' | '\\' | ':' | '*' | '?' | '<' | '>' | '|' => Some('_'),
+            c if (c as u32) < 0x20 => Some('_'),
+            c => Some(c),
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Resolve a sane file extension for a track download.
+///
+/// Preference order:
+/// 1. The extension of the server-side path (`MediaSourceInfo.path`).
+///    This is the most reliable — it's literally the file on disk.
+/// 2. `MediaSourceInfo.container`, normalised (split on commas, take
+///    the first entry, lowercase, map common Jellyfin spellings to
+///    the conventional extension).
+/// 3. `flac` as a last-resort default — every lossless source the
+///    user listens to is one of FLAC/ALAC/WAV/DSD, and `.flac` is the
+///    most likely to be correct *and* not destructive (Finder shows
+///    it as audio either way, and we never overwrite a different
+///    file silently because the title is in the filename).
+fn pick_extension(path: Option<&str>, container: Option<&str>) -> String {
+    if let Some(p) = path
+        && let Some(ext) = std::path::Path::new(p).extension()
+        && let Some(s) = ext.to_str()
+    {
+        let lower = s.to_ascii_lowercase();
+        if !lower.is_empty() {
+            return lower;
+        }
+    }
+    if let Some(c) = container {
+        let raw = c
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let normalised = match raw.as_str() {
+            "" => None,
+            // Jellyfin sometimes returns "mp4" for ALAC-in-m4a.
+            "mp4" => Some("m4a"),
+            "ogg" | "vorbis" => Some("ogg"),
+            "wave" => Some("wav"),
+            other => Some(other),
+        };
+        if let Some(n) = normalised {
+            return n.to_string();
+        }
+    }
+    "flac".to_string()
+}
+
+/// Only touch the UI when the user is still looking at this album.
+/// If they navigated away, the task keeps writing files but stops
+/// poking the window (the next album view will reset state anyway).
+fn push_download_status(
+    weak: &slint::Weak<MainWindow>,
+    current_album_id: &Arc<Mutex<Option<String>>>,
+    album_id: &str,
+    label: String,
+    enabled: bool,
+    active: bool,
+) {
+    let same = current_album_id
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|cur| cur == album_id);
+    if !same {
+        return;
+    }
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_album_download_label(SharedString::from(label));
+            w.set_album_download_enabled(enabled);
+            w.set_album_download_active(active);
+        }
+    });
+}
+
+fn reset_album_download_ui(weak: &slint::Weak<MainWindow>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_album_download_label(SharedString::from("⬇  Descargar álbum"));
+            w.set_album_download_enabled(true);
+            w.set_album_download_active(false);
         }
     });
 }
