@@ -13,11 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 jellyfin-api.workspace = true
-jelly-core.workspace = true
+jlfine-core.workspace = true
 audio-engine.workspace = true
 video-engine.workspace = true
-jelly-storage.workspace = true
-jelly-ui.workspace = true
+jlfine-storage.workspace = true
+jlfine-ui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

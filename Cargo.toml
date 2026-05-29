@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/jellyfin-api",
-    "crates/jelly-core",
+    "crates/jlfine-core",
     "crates/audio-engine",
     "crates/video-engine",
-    "crates/jelly-storage",
-    "crates/jelly-ui",
+    "crates/jlfine-storage",
+    "crates/jlfine-ui",
     "apps/jlfine",
     "apps/poc-libmpv",
     "apps/poc-bitperfect-mac",
@@ -23,11 +23,11 @@ publish = false
 
 [workspace.dependencies]
 jellyfin-api = { path = "crates/jellyfin-api" }
-jelly-core = { path = "crates/jelly-core" }
+jlfine-core = { path = "crates/jlfine-core" }
 audio-engine = { path = "crates/audio-engine" }
 video-engine = { path = "crates/video-engine" }
-jelly-storage = { path = "crates/jelly-storage" }
-jelly-ui = { path = "crates/jelly-ui" }
+jlfine-storage = { path = "crates/jlfine-storage" }
+jlfine-ui = { path = "crates/jlfine-ui" }
 
 anyhow = "1"
 thiserror = "2"

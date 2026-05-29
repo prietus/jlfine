@@ -107,10 +107,10 @@ pub fn play(url: impl Into<String>, audio_device: Option<String>) {
         // is unreliable with the Metal gpu-next VO). We only bridge
         // keyboard: an app-wide NSEvent monitor forwards keys aimed at
         // mpv's window into mpv. To tell mpv's window apart from
-        // jelly-ui's, snapshot the existing windows *before* mpv opens
+        // jlfine-ui's, snapshot the existing windows *before* mpv opens
         // its own.
         //
-        // jelly-ui's backend loop runs inside a tokio multi_thread
+        // jlfine-ui's backend loop runs inside a tokio multi_thread
         // runtime, so this lands on a worker thread already. mpv
         // expects to live off the main thread (its mac VO dispatches
         // window work back to main via GCD); only the snapshot and the

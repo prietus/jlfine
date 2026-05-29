@@ -3,7 +3,7 @@
 //! One main window, two screens (login / library). The UI runs on the
 //! main thread under Slint's event loop. A worker thread carries a
 //! tokio runtime that handles all networking against jellyfin-api and
-//! all persistence against jelly-storage. Commands flow UI → backend
+//! all persistence against jlfine-storage. Commands flow UI → backend
 //! via an mpsc channel; updates flow backend → UI via
 //! `slint::invoke_from_event_loop`, the only thread-safe way to mutate
 //! window state in Slint.
@@ -18,12 +18,12 @@
 
 use anyhow::{Context, Result};
 use audio_engine::AudioEngine;
-use jelly_storage::Storage;
 use jellyfin_api::{
     BaseItemDto, Client, Identity, ImageOptions, ImageType as ApiImageType, ItemType, ItemsQuery,
     MediaStream, PersonInfo, SortOrder, audio_stream_url, image_url, ticks_to_seconds,
     video_stream_url,
 };
+use jlfine_storage::Storage;
 use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
 use std::sync::Arc;
 use std::sync::Mutex;

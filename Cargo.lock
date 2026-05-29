@@ -2597,45 +2597,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jelly-core"
-version = "0.1.0"
-
-[[package]]
-name = "jelly-storage"
-version = "0.1.0"
-dependencies = [
- "directories",
- "keyring",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "jelly-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "audio-engine",
- "directories",
- "futures-util",
- "image",
- "jelly-storage",
- "jellyfin-api",
- "reqwest",
- "slint",
- "slint-build",
- "tokio",
- "tracing",
- "url",
- "video-engine",
-]
-
-[[package]]
 name = "jellyfin-api"
 version = "0.1.0"
 dependencies = [
@@ -2655,12 +2616,51 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "audio-engine",
- "jelly-core",
- "jelly-storage",
- "jelly-ui",
  "jellyfin-api",
+ "jlfine-core",
+ "jlfine-storage",
+ "jlfine-ui",
  "tracing",
  "tracing-subscriber",
+ "video-engine",
+]
+
+[[package]]
+name = "jlfine-core"
+version = "0.1.0"
+
+[[package]]
+name = "jlfine-storage"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "jlfine-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audio-engine",
+ "directories",
+ "futures-util",
+ "image",
+ "jellyfin-api",
+ "jlfine-storage",
+ "reqwest",
+ "slint",
+ "slint-build",
+ "tokio",
+ "tracing",
+ "url",
  "video-engine",
 ]
 

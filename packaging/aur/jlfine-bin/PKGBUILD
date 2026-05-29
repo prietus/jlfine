@@ -16,7 +16,7 @@ conflicts=('jlfine')
 # AFTER the icon + packaging files were added). Run `updpkgsums` to
 # replace the SKIP placeholders with real checksums.
 source=("jlfine-$pkgver::https://github.com/prietus/jlfine/releases/download/v$pkgver/jlfine-linux-x86_64"
-        "jlfine-$pkgver.png::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/crates/jelly-ui/ui/icon.png"
+        "jlfine-$pkgver.png::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/crates/jlfine-ui/ui/icon.png"
         "jlfine-$pkgver.desktop::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/packaging/jlfine.desktop"
         "LICENSE-$pkgver::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/LICENSE")
 sha256sums=('SKIP'

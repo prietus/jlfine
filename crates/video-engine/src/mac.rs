@@ -11,11 +11,11 @@
 //! app-wide `NSEvent` local monitor: it fires for every key event the
 //! app dispatches regardless of which window is key, we translate the
 //! ones aimed at mpv's window into mpv commands, and we leave the
-//! jelly-ui (Slint) windows untouched.
+//! jlfine-ui (Slint) windows untouched.
 //!
 //! "Which window is mpv's" is decided by exclusion: [`snapshot_windows`]
 //! records the window numbers that exist *before* mpv starts (the
-//! jelly-ui windows); any other key window is mpv's.
+//! jlfine-ui windows); any other key window is mpv's.
 //!
 //! This module only knows about AppKit. The mpv lifecycle lives in
 //! `lib.rs`.
@@ -38,8 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 /// Snapshot the window numbers of every window the app currently owns
-/// — these are jelly-ui's Slint windows, captured just before mpv
-/// opens its own. The key monitor uses this set to tell jelly-ui
+/// — these are jlfine-ui's Slint windows, captured just before mpv
+/// opens its own. The key monitor uses this set to tell jlfine-ui
 /// windows (leave alone) from mpv's window (forward keys). Must run
 /// on the main thread.
 pub fn snapshot_windows() -> Vec<isize> {
@@ -59,7 +59,7 @@ pub fn snapshot_windows() -> Vec<isize> {
 /// forward keys aimed at mpv's window into mpv as commands — same
 /// mapping as a vanilla mpv CLI session (space=pause, arrows=seek,
 /// f=fullscreen, i=stats, m=mute, q=quit, a/s cycle audio/subs). Key
-/// events whose window is one of `pre_windows` (jelly-ui's) pass
+/// events whose window is one of `pre_windows` (jlfine-ui's) pass
 /// through untouched so Slint keeps its shortcuts.
 ///
 /// The block holds a `Weak<Mpv>` rather than a strong `Arc<Mpv>` so
@@ -77,7 +77,7 @@ pub fn install_key_monitor(id: u64, pre_windows: Vec<isize>, mpv: Weak<Mpv>) {
             // of this dispatch; we never keep it past the closure.
             let event = unsafe { event_ptr.as_ref() };
             let win_num = unsafe { event.windowNumber() };
-            // A pre-existing (jelly-ui) window has focus — don't touch
+            // A pre-existing (jlfine-ui) window has focus — don't touch
             // its keys.
             if pre_windows.contains(&win_num) {
                 return event_ptr.as_ptr();
@@ -180,7 +180,7 @@ where
 }
 
 /// Run a closure on the main thread and block until it returns its
-/// value. Used to snapshot the jelly-ui windows before mpv opens its
+/// value. Used to snapshot the jlfine-ui windows before mpv opens its
 /// own. Safe to call from the worker because the main thread (Slint
 /// event loop) services the main dispatch queue and is not waiting on
 /// the worker at this point.

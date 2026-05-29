@@ -1,5 +1,5 @@
 [package]
-name = "jelly-ui"
+name = "jlfine-ui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ publish.workspace = true
 slint.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 jellyfin-api.workspace = true
-jelly-storage.workspace = true
+jlfine-storage.workspace = true
 video-engine.workspace = true
 audio-engine.workspace = true
 anyhow.workspace = true

@@ -38,7 +38,7 @@ build() {
 
 package() {
 	install -Dm755 "$_pkgname/target/release/jlfine" "$pkgdir/usr/bin/jlfine"
-	install -Dm644 "$_pkgname/crates/jelly-ui/ui/icon.png" "$pkgdir/usr/share/pixmaps/jlfine.png"
+	install -Dm644 "$_pkgname/crates/jlfine-ui/ui/icon.png" "$pkgdir/usr/share/pixmaps/jlfine.png"
 	install -Dm644 "$_pkgname/packaging/jlfine.desktop" "$pkgdir/usr/share/applications/jlfine.desktop"
 	install -Dm644 "$_pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
