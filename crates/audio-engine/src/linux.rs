@@ -319,6 +319,23 @@ pub fn supports_dsd_native(
     hwp.set_format(Format::DSDU32BE).is_ok()
 }
 
+/// Selects the per-sample transform applied in the DSD write loop.
+/// Native and DoP share the open/hwparams/prefill setup but differ
+/// in the typed IO and the bit alignment of the u32 they're handed
+/// (see `play_stream_dsd_generic`).
+enum DsdMode {
+    /// `Format::DSDU32BE`. Write `u32` straight from the ring —
+    /// alsa-rs's `io_i32` rejects DSDU32BE in its type/format check,
+    /// so we bind `io_u32`.
+    Native,
+    /// `Format::S32_LE` carrying DoP. The `DopPacker` emits the
+    /// 24-bit value AlignedLow (`0x00_MM_DD_DD`); ALSA's 24-in-32
+    /// convention is AlignedHigh — the marker has to be in the top
+    /// byte where the DAC actually looks — so we shift each sample
+    /// left by 8 (`0xMM_DD_DD_00`) before writing.
+    Dop,
+}
+
 pub fn play_stream_dop(
     consumer: Consumer<u32>,
     pcm_rate: u32,
@@ -342,6 +359,7 @@ pub fn play_stream_dop(
         exclusive,
         cancel,
         eof,
+        DsdMode::Dop,
     )
 }
 
@@ -366,6 +384,7 @@ pub fn play_stream_dsd_native(
         exclusive,
         cancel,
         eof,
+        DsdMode::Native,
     )
 }
 
@@ -379,6 +398,7 @@ fn play_stream_dsd_generic(
     exclusive: bool,
     cancel: &Arc<AtomicBool>,
     eof: Arc<AtomicBool>,
+    mode: DsdMode,
 ) -> Result<(), AlsaError> {
     let device_name = resolve_device(audio_device, exclusive)?;
     tracing::info!(
@@ -440,42 +460,85 @@ fn play_stream_dsd_generic(
 
     let chunk_samples = (period_frames as usize) * (channels as usize);
     let mut u32_buf: Vec<u32> = vec![0; chunk_samples];
-    // io_i32 + bit-equivalent cast is bytewise identical to io_u32
-    // and works on every alsa-rs version we care about. The kernel
-    // interprets the bytes per the format flag, not per the sign.
-    let io = pcm.io_i32().map_err(AlsaError::Write)?;
 
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            break;
-        }
-        let avail = consumer.slots();
-        if avail == 0 {
-            if eof.load(Ordering::Acquire) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-        let take = avail.min(chunk_samples);
-        let chunk = match consumer.read_chunk(take) {
-            Ok(c) => c,
-            Err(_) => {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-        };
-        let (s1, s2) = chunk.as_slices();
-        u32_buf[..s1.len()].copy_from_slice(s1);
-        u32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
-        chunk.commit_all();
+    // Two write loops sharing the same ring-buffer drain. They
+    // differ in the typed IO (DSDU32BE needs io_u32; alsa-rs rejects
+    // io_i32 against DSDU32BE with "Operation not supported") and,
+    // for DoP, the AlignedLow → AlignedHigh shift so the marker lands
+    // in the top byte the DAC actually inspects.
+    match mode {
+        DsdMode::Native => {
+            let io = pcm.io_u32().map_err(AlsaError::Write)?;
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let avail = consumer.slots();
+                if avail == 0 {
+                    if eof.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                let take = avail.min(chunk_samples);
+                let chunk = match consumer.read_chunk(take) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                let (s1, s2) = chunk.as_slices();
+                u32_buf[..s1.len()].copy_from_slice(s1);
+                u32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
+                chunk.commit_all();
 
-        let i32_slice = unsafe { std::slice::from_raw_parts(u32_buf.as_ptr() as *const i32, take) };
-        match io.writei(i32_slice) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(?e, "DSD writei error, attempting recover");
-                pcm.try_recover(e, true).map_err(AlsaError::Write)?;
+                if let Err(e) = io.writei(&u32_buf[..take]) {
+                    tracing::warn!(?e, "DSD writei error, attempting recover");
+                    pcm.try_recover(e, true).map_err(AlsaError::Write)?;
+                }
+            }
+        }
+        DsdMode::Dop => {
+            let io = pcm.io_i32().map_err(AlsaError::Write)?;
+            let mut i32_buf: Vec<i32> = vec![0; chunk_samples];
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                let avail = consumer.slots();
+                if avail == 0 {
+                    if eof.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                let take = avail.min(chunk_samples);
+                let chunk = match consumer.read_chunk(take) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                let (s1, s2) = chunk.as_slices();
+                u32_buf[..s1.len()].copy_from_slice(s1);
+                u32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
+                chunk.commit_all();
+
+                // AlignedLow → AlignedHigh: marker moves from bits
+                // 23..16 to bits 31..24 so the DAC's DoP detector
+                // sees it in the MSB of the 32-bit S32_LE sample.
+                for (dst, src) in i32_buf[..take].iter_mut().zip(&u32_buf[..take]) {
+                    *dst = (src << 8) as i32;
+                }
+
+                if let Err(e) = io.writei(&i32_buf[..take]) {
+                    tracing::warn!(?e, "DSD writei error, attempting recover");
+                    pcm.try_recover(e, true).map_err(AlsaError::Write)?;
+                }
             }
         }
     }
