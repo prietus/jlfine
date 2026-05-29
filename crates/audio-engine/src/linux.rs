@@ -468,7 +468,18 @@ fn play_stream_dsd_generic(
     // in the top byte the DAC actually inspects.
     match mode {
         DsdMode::Native => {
-            let io = pcm.io_u32().map_err(AlsaError::Write)?;
+            // alsa-rs's `verify_format` whitelists `U32LE` for
+            // `io_u32` (its `IoFormat` impl maps u32 → U32LE), so
+            // both `io_u32()` and `io_i32()` return
+            // `Err("io_xx Operation not supported")` against
+            // DSDU32BE even though u32 *is* the right type for it.
+            // `io_unchecked` skips the format check; safety
+            // contract (`S` is the right type for this PCM) is
+            // satisfied — DSDU32BE is a 32-bit unsigned format and
+            // alsa-rs's typed IO doesn't care about byte order
+            // (it writes the bytes verbatim and lets the kernel /
+            // USB driver interpret per the format flag).
+            let io = unsafe { pcm.io_unchecked::<u32>() };
             loop {
                 if cancel.load(Ordering::Acquire) {
                     break;
