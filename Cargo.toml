@@ -7,7 +7,7 @@ members = [
     "crates/video-engine",
     "crates/jelly-storage",
     "crates/jelly-ui",
-    "apps/jelly",
+    "apps/jlfine",
     "apps/poc-libmpv",
     "apps/poc-bitperfect-mac",
     "apps/poc-jellyfin-api",

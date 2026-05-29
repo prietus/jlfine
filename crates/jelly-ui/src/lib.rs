@@ -1,4 +1,4 @@
-//! Slint frontend for the jelly client.
+//! Slint frontend for the jlfine client.
 //!
 //! One main window, two screens (login / library). The UI runs on the
 //! main thread under Slint's event loop. A worker thread carries a
@@ -1533,8 +1533,8 @@ fn format_duration(ticks: i64) -> String {
 
 fn make_identity(device_id: &str) -> Identity {
     Identity::new(
-        "Jelly",
-        "jelly-desktop",
+        "jlfine",
+        "jlfine-desktop",
         device_id,
         env!("CARGO_PKG_VERSION"),
     )
@@ -2267,7 +2267,7 @@ async fn run_album_download(
     Ok(())
 }
 
-/// `~/Music/Jelly/<artist>/<album>/`. The `directories` crate already
+/// `~/Music/jlfine/<artist>/<album>/`. The `directories` crate already
 /// hands us `audio_dir` cross-platform (`$XDG_MUSIC_DIR` or `~/Music`
 /// on Linux, `~/Music` on macOS). Falls back to `$HOME/Music` if the
 /// crate can't resolve user dirs.
@@ -2277,7 +2277,7 @@ fn album_download_dir(artist: &str, album: &str) -> Result<std::path::PathBuf> {
         .or_else(dirs_fallback)
         .ok_or_else(|| anyhow::anyhow!("no user music dir"))?;
     Ok(music
-        .join("Jelly")
+        .join("jlfine")
         .join(sanitize_path_component(artist))
         .join(sanitize_path_component(album)))
 }

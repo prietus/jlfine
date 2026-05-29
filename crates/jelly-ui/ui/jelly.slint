@@ -1,4 +1,4 @@
-// jelly desktop client — login + library shell.
+// jlfine desktop client — login + library shell.
 //
 // One window, two screens (login / library) selected by the `screen`
 // property. Backend toggles `busy` while async work is in flight and
@@ -101,7 +101,7 @@ component LoginScreen inherits Rectangle {
             spacing: 18px;
 
             Text {
-                text: "jelly";
+                text: "jlfine";
                 font-size: 32px;
                 font-weight: 700;
                 color: Theme.text-primary;
@@ -120,7 +120,7 @@ component LoginScreen inherits Rectangle {
                 color: Theme.text-muted;
             }
             server-input := LineEdit {
-                placeholder-text: "https://jelly.example.com";
+                placeholder-text: "https://jellyfin.example.com";
                 text <=> root.server-url;
                 enabled: !root.busy;
             }
@@ -1612,7 +1612,7 @@ component SettingsScreen inherits Rectangle {
 // --- root window ---------------------------------------------------
 
 export component MainWindow inherits Window {
-    title: "jelly";
+    title: "jlfine";
     icon: @image-url("icon.png");
     preferred-width: 1100px;
     preferred-height: 720px;

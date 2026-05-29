@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=jelly
+Name=jlfine
 GenericName=Jellyfin Client
 Comment=Native Jellyfin client with bit-perfect audio and HDR video
-Exec=jelly
-Icon=jelly
+Exec=jlfine
+Icon=jlfine
 Terminal=false
 Categories=AudioVideo;Player;Audio;Video;
 Keywords=jellyfin;media;music;movies;series;
-StartupWMClass=jelly
+StartupWMClass=jlfine

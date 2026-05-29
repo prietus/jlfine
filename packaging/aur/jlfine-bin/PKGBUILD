@@ -1,6 +1,6 @@
 # Maintainer: Carlos <cprieto.ortiz@gmail.com>
-pkgname=jelly-bin
-_pkgname=jelly
+pkgname=jlfine-bin
+_pkgname=jlfine
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Native Jellyfin desktop client with bit-perfect audio and HDR/Dolby Vision video (Slint + libmpv)"
@@ -9,15 +9,15 @@ url="https://github.com/prietus/jlfine"
 license=('MIT')
 # Runtime libraries the prebuilt binary loads. Verify with `namcap`.
 depends=('mpv' 'alsa-lib' 'dbus' 'fontconfig' 'libxkbcommon' 'libglvnd' 'wayland')
-provides=('jelly')
-conflicts=('jelly')
+provides=('jlfine')
+conflicts=('jlfine')
 # The binary comes from the GitHub release; icon/license/desktop are
 # fetched from the repo at the matching tag (so the tag must be cut
 # AFTER the icon + packaging files were added). Run `updpkgsums` to
 # replace the SKIP placeholders with real checksums.
-source=("jelly-$pkgver::https://github.com/prietus/jlfine/releases/download/v$pkgver/jelly-linux-x86_64"
-        "jelly-$pkgver.png::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/crates/jelly-ui/ui/icon.png"
-        "jelly-$pkgver.desktop::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/packaging/jelly.desktop"
+source=("jlfine-$pkgver::https://github.com/prietus/jlfine/releases/download/v$pkgver/jlfine-linux-x86_64"
+        "jlfine-$pkgver.png::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/crates/jelly-ui/ui/icon.png"
+        "jlfine-$pkgver.desktop::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/packaging/jlfine.desktop"
         "LICENSE-$pkgver::https://raw.githubusercontent.com/prietus/jlfine/v$pkgver/LICENSE")
 sha256sums=('SKIP'
             'SKIP'
@@ -25,8 +25,8 @@ sha256sums=('SKIP'
             'SKIP')
 
 package() {
-	install -Dm755 "jelly-$pkgver" "$pkgdir/usr/bin/jelly"
-	install -Dm644 "jelly-$pkgver.png" "$pkgdir/usr/share/pixmaps/jelly.png"
-	install -Dm644 "jelly-$pkgver.desktop" "$pkgdir/usr/share/applications/jelly.desktop"
+	install -Dm755 "jlfine-$pkgver" "$pkgdir/usr/bin/jlfine"
+	install -Dm644 "jlfine-$pkgver.png" "$pkgdir/usr/share/pixmaps/jlfine.png"
+	install -Dm644 "jlfine-$pkgver.desktop" "$pkgdir/usr/share/applications/jlfine.desktop"
 	install -Dm644 "LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -35,13 +35,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release -p jelly
+        run: cargo build --release -p jlfine
 
       - name: Rename binary
-        run: cp target/release/jelly jelly-linux-x86_64
+        run: cp target/release/jlfine jlfine-linux-x86_64
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: jelly-linux-x86_64
+          files: jlfine-linux-x86_64
           generate_release_notes: true

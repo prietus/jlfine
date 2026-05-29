@@ -1,4 +1,4 @@
-# jelly
+# jlfine
 
 A native desktop client for [Jellyfin](https://jellyfin.org), written in Rust,
 with a focus on **bit-perfect audio** and **HDR / Dolby Vision video**.
@@ -45,7 +45,7 @@ Windows is not supported yet.
 ### Build & run
 
 ```sh
-cargo run --release -p jelly
+cargo run --release -p jlfine
 ```
 
 On first launch, sign in with your Jellyfin server URL, username and password.
@@ -57,7 +57,7 @@ This is a Cargo workspace:
 
 | Crate                 | Purpose                                                   |
 | --------------------- | --------------------------------------------------------- |
-| `apps/jelly`          | Desktop application entry point                           |
+| `apps/jlfine`         | Desktop application entry point                           |
 | `crates/jelly-ui`     | Slint UI (login, library, detail pages, settings)         |
 | `crates/jellyfin-api` | Jellyfin HTTP API client                                  |
 | `crates/video-engine` | libmpv-backed video playback                              |
