@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=jelly
+GenericName=Jellyfin Client
+Comment=Native Jellyfin client with bit-perfect audio and HDR video
+Exec=jelly
+Icon=jelly
+Terminal=false
+Categories=AudioVideo;Player;Audio;Video;
+Keywords=jellyfin;media;music;movies;series;
+StartupWMClass=jelly
