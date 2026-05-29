@@ -103,42 +103,43 @@ pub fn play(url: impl Into<String>, audio_device: Option<String>) {
 
     #[cfg(target_os = "macos")]
     {
+        // mpv owns its own window on macOS (the `wid` embedding path
+        // is unreliable with the Metal gpu-next VO). We only bridge
+        // keyboard: an app-wide NSEvent monitor forwards keys aimed at
+        // mpv's window into mpv. To tell mpv's window apart from
+        // jelly-ui's, snapshot the existing windows *before* mpv opens
+        // its own.
+        //
         // jelly-ui's backend loop runs inside a tokio multi_thread
-        // runtime, so this call lands on a worker thread. The
-        // NSWindow needs the main thread (AppKit); mpv itself
+        // runtime, so this lands on a worker thread already. mpv
         // expects to live off the main thread (its mac VO dispatches
-        // back to main internally via GCD). So: window on main,
-        // mpv on a worker, key monitor hopped back to main once
-        // mpv exists.
-        mac::run_on_main(move || {
-            let window = mac::VideoWindow::new("jelly · video");
-            let view_ptr = window.view_ptr_for_mpv();
-            let slot_id = mac::register_window(window);
+        // window work back to main via GCD); only the snapshot and the
+        // monitor install/remove hop to main.
+        thread::spawn(move || {
+            let pre_windows = mac::run_on_main_sync(mac::snapshot_windows);
 
-            thread::spawn(move || {
-                let mpv = match build_mpv(audio_device, Some(view_ptr)) {
-                    Ok(m) => Arc::new(m),
-                    Err(e) => {
-                        error!(?e, "mpv init failed");
-                        mac::run_on_main(move || mac::unregister_window(slot_id));
-                        return;
-                    }
-                };
-                // Hop back to main to install the NSEvent monitor —
-                // mpv handle is Send+Sync so cloning the Arc across
-                // threads is fine.
-                let mpv_for_keys = mpv.clone();
-                mac::run_on_main(move || {
-                    mac::install_key_handler(slot_id, mpv_for_keys);
-                });
-
-                if let Err(e) = mpv.command("loadfile", &[&url]) {
-                    error!(?e, "loadfile failed");
+            let mpv = match build_mpv(audio_device, None) {
+                Ok(m) => Arc::new(m),
+                Err(e) => {
+                    error!(?e, "mpv init failed");
+                    return;
                 }
-                pump_mpv_events(&mpv);
-                drop(mpv);
-                mac::run_on_main(move || mac::unregister_window(slot_id));
+            };
+
+            let monitor_id = mac::next_monitor_id();
+            // mpv handle is Send+Sync; the monitor only holds a Weak so
+            // the worker keeps the last strong ref (see mac.rs).
+            let mpv_weak = Arc::downgrade(&mpv);
+            mac::run_on_main(move || {
+                mac::install_key_monitor(monitor_id, pre_windows, mpv_weak);
             });
+
+            if let Err(e) = mpv.command("loadfile", &[&url]) {
+                error!(?e, "loadfile failed");
+            }
+            pump_mpv_events(&mpv);
+            drop(mpv);
+            mac::run_on_main(move || mac::remove_key_monitor(monitor_id));
         });
         return;
     }

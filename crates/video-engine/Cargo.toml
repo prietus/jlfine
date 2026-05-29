@@ -20,6 +20,7 @@ serde_json.workspace = true
 # rendering — key events flow through us into mpv_command.
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = [
+    "NSArray",
     "NSNotification",
     "NSOperation",
     "NSString",
