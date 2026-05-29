@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libmpv2-sys links -lmpv at build time, and the workspace pulls
+      # ALSA (audio), D-Bus (keyring), fontconfig + xkbcommon (Slint).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libmpv-dev \
+            libasound2-dev \
+            libdbus-1-dev \
+            libfontconfig-dev \
+            libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p jelly
+
+      - name: Package
+        run: |
+          pkg="jelly-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "$pkg"
+          cp target/release/jelly "$pkg/"
+          cp README.md LICENSE "$pkg/"
+          tar -czf "$pkg.tar.gz" "$pkg"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: jelly-*-linux-x86_64.tar.gz
+          generate_release_notes: true
