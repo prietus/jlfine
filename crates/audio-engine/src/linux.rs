@@ -303,7 +303,16 @@ pub fn play_stream_dop(
     if !exclusive {
         return Err(AlsaError::DopRequiresExclusive);
     }
-    play_stream_dsd_generic(consumer, Format::S32LE, pcm_rate, channels, audio_device, exclusive, cancel, eof)
+    play_stream_dsd_generic(
+        consumer,
+        Format::S32LE,
+        pcm_rate,
+        channels,
+        audio_device,
+        exclusive,
+        cancel,
+        eof,
+    )
 }
 
 pub fn play_stream_dsd_native(
@@ -359,9 +368,12 @@ fn play_stream_dsd_generic(
     {
         let hwp = HwParams::any(&pcm).map_err(AlsaError::HwParams)?;
         hwp.set_channels(channels).map_err(AlsaError::HwParams)?;
-        hwp.set_rate(rate, ValueOr::Nearest).map_err(AlsaError::HwParams)?;
-        hwp.set_format(format).map_err(|_| AlsaError::UnsupportedFormat)?;
-        hwp.set_access(Access::RWInterleaved).map_err(AlsaError::HwParams)?;
+        hwp.set_rate(rate, ValueOr::Nearest)
+            .map_err(AlsaError::HwParams)?;
+        hwp.set_format(format)
+            .map_err(|_| AlsaError::UnsupportedFormat)?;
+        hwp.set_access(Access::RWInterleaved)
+            .map_err(AlsaError::HwParams)?;
         hwp.set_buffer_size_near(buffer_frames as i64)
             .map_err(AlsaError::HwParams)?;
         hwp.set_period_size_near(period_frames as i64, ValueOr::Nearest)
@@ -428,9 +440,7 @@ fn play_stream_dsd_generic(
         u32_buf[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
         chunk.commit_all();
 
-        let i32_slice = unsafe {
-            std::slice::from_raw_parts(u32_buf.as_ptr() as *const i32, take)
-        };
+        let i32_slice = unsafe { std::slice::from_raw_parts(u32_buf.as_ptr() as *const i32, take) };
         match io.writei(i32_slice) {
             Ok(_) => {}
             Err(e) => {

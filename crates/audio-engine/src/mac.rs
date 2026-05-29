@@ -830,7 +830,11 @@ unsafe extern "C" fn dop_io_proc(
             for slice in [s1, s2] {
                 for samples in slice.chunks_exact(channels) {
                     let frame_off = frame_idx * bytes_per_frame;
-                    write_dop_frame(&mut out[frame_off..frame_off + bytes_per_frame], samples, marker);
+                    write_dop_frame(
+                        &mut out[frame_off..frame_off + bytes_per_frame],
+                        samples,
+                        marker,
+                    );
                     marker = flip_marker(marker);
                     frame_idx += 1;
                 }
@@ -851,7 +855,13 @@ unsafe extern "C" fn dop_io_proc(
         } else {
             (DOP_SILENCE_HI, DOP_SILENCE_LO)
         };
-        write_dop_silence_frame(&mut out[frame_off..frame_off + bytes_per_frame], channels, marker, hi, lo);
+        write_dop_silence_frame(
+            &mut out[frame_off..frame_off + bytes_per_frame],
+            channels,
+            marker,
+            hi,
+            lo,
+        );
         marker = flip_marker(marker);
     }
 
@@ -931,9 +941,7 @@ fn available_physical_formats_property() -> AudioObjectPropertyAddress {
 fn first_output_stream(device_id: AudioObjectID) -> Result<AudioStreamID, HalError> {
     let addr = streams_property();
     let mut size: u32 = 0;
-    let s = unsafe {
-        AudioObjectGetPropertyDataSize(device_id, &addr, 0, ptr::null(), &mut size)
-    };
+    let s = unsafe { AudioObjectGetPropertyDataSize(device_id, &addr, 0, ptr::null(), &mut size) };
     if s != 0 {
         return Err(HalError::EnumerateStreams(s));
     }
@@ -964,9 +972,7 @@ fn first_output_stream(device_id: AudioObjectID) -> Result<AudioStreamID, HalErr
 fn log_available_physical_formats(stream_id: AudioStreamID) {
     let addr = available_physical_formats_property();
     let mut size: u32 = 0;
-    let s = unsafe {
-        AudioObjectGetPropertyDataSize(stream_id, &addr, 0, ptr::null(), &mut size)
-    };
+    let s = unsafe { AudioObjectGetPropertyDataSize(stream_id, &addr, 0, ptr::null(), &mut size) };
     if s != 0 || size == 0 {
         tracing::debug!(stream_id, status = s, "no available physical formats");
         return;
@@ -1008,9 +1014,7 @@ fn physical_format_supported(
 ) -> Result<bool, HalError> {
     let addr = available_physical_formats_property();
     let mut size: u32 = 0;
-    let s = unsafe {
-        AudioObjectGetPropertyDataSize(stream_id, &addr, 0, ptr::null(), &mut size)
-    };
+    let s = unsafe { AudioObjectGetPropertyDataSize(stream_id, &addr, 0, ptr::null(), &mut size) };
     if s != 0 {
         return Err(HalError::EnumeratePhysicalFormats(s));
     }
@@ -1032,7 +1036,9 @@ fn physical_format_supported(
     if s != 0 {
         return Err(HalError::EnumeratePhysicalFormats(s));
     }
-    Ok(buf.iter().any(|d| asbd_compatible(&d.mFormat, target, &d.mSampleRateRange)))
+    Ok(buf
+        .iter()
+        .any(|d| asbd_compatible(&d.mFormat, target, &d.mSampleRateRange)))
 }
 
 /// Strict match for "already at the DoP target" — every field that

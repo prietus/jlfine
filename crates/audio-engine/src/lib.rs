@@ -118,7 +118,8 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
             Cmd::Play { container, .. }
                 if matches!(container.as_deref(), Some("dsf") | Some("dff"))
         );
-        if current_was_dsd && next_is_dsd
+        if current_was_dsd
+            && next_is_dsd
             && let Some(s) = &current_skip_restore
         {
             s.store(true, Ordering::SeqCst);
@@ -187,7 +188,9 @@ fn play_blocking(
         // decode DSD, and the backend has to negotiate either DoP
         // (24-bit PCM with marker bytes) or a native DSD format on
         // Linux. PCM/lossless containers all flow through symphonia.
-        "dsf" | "dff" => play_dsd_blocking(url, &ext, audio_device, exclusive, cancel, skip_restore),
+        "dsf" | "dff" => {
+            play_dsd_blocking(url, &ext, audio_device, exclusive, cancel, skip_restore)
+        }
         // PCM path doesn't touch the physical format, so there's
         // nothing to skip restoring — the parameter is dropped.
         _ => play_pcm_blocking(url, container, audio_device, exclusive, cancel),
@@ -480,7 +483,14 @@ fn play_dsd_blocking(
     let cancel_dec = cancel.clone();
     let channels_usize = channels as usize;
     let decoder_handle = thread::Builder::new()
-        .name(if native { "dsd-native-packer" } else { "dop-packer" }.into())
+        .name(
+            if native {
+                "dsd-native-packer"
+            } else {
+                "dop-packer"
+            }
+            .into(),
+        )
         .spawn(move || {
             let mut producer = producer;
             if native {

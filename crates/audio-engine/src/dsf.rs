@@ -34,7 +34,10 @@ pub enum Error {
     #[error("not a DSF stream (bad magic {0:?})")]
     BadMagic([u8; 4]),
     #[error("expected chunk {expected:?}, got {got:?}")]
-    UnexpectedChunk { expected: &'static [u8; 4], got: [u8; 4] },
+    UnexpectedChunk {
+        expected: &'static [u8; 4],
+        got: [u8; 4],
+    },
     #[error("unsupported DSF: {0}")]
     Unsupported(&'static str),
     #[error("invalid DSF field: {0}")]
@@ -135,7 +138,11 @@ impl<R: Read> DsfReader<R> {
         }
         for (ch, slot) in out.iter_mut().enumerate() {
             let raw = self.channel_blocks[ch][self.pos_in_block];
-            *slot = if self.lsb_first { raw.reverse_bits() } else { raw };
+            *slot = if self.lsb_first {
+                raw.reverse_bits()
+            } else {
+                raw
+            };
         }
         self.pos_in_block += 1;
         self.bytes_yielded_per_channel += 1;
@@ -212,7 +219,10 @@ fn read_fmt_chunk<R: Read>(r: &mut R) -> Result<(DsfHeader, bool), Error> {
         return Err(Error::Invalid("channel count out of range"));
     }
     let sampling_frequency = read_u32_le(r)?;
-    if !matches!(sampling_frequency, 2_822_400 | 5_644_800 | 11_289_600 | 22_579_200) {
+    if !matches!(
+        sampling_frequency,
+        2_822_400 | 5_644_800 | 11_289_600 | 22_579_200
+    ) {
         return Err(Error::Unsupported("unexpected DSD sampling frequency"));
     }
     let bits_per_sample = read_u32_le(r)?;

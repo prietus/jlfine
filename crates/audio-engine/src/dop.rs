@@ -146,5 +146,4 @@ mod tests {
     fn dsd128_pcm_rate_is_352_8khz() {
         assert_eq!(DopPacker::pcm_sample_rate(5_644_800), 352_800);
     }
-
 }
