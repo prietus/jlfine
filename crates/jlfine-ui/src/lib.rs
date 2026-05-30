@@ -516,6 +516,8 @@ async fn run_authed(
                 if let Err(e) = storage.clear_session() {
                     error!(?e, "clear_session failed");
                 }
+                state.audio.stop();
+                clear_now_playing(&state.weak);
                 push_signed_out(&state.weak);
                 return;
             }
@@ -610,9 +612,9 @@ async fn activate(
                 warn!("no token; cannot play");
                 return;
             };
-            let container = current_items
-                .iter()
-                .find(|i| i.id == item_id)
+            let item = current_items.iter().find(|i| i.id == item_id).cloned();
+            let container = item
+                .as_ref()
                 .and_then(|i| i.media_sources.as_ref())
                 .and_then(|m| m.first())
                 .and_then(|s| s.container.clone());
@@ -620,6 +622,9 @@ async fn activate(
             let audio_device = state.storage.audio_device().ok().flatten();
             let exclusive = state.storage.exclusive_mode().unwrap_or(true);
             info!(%url, container = ?container, ?audio_device, exclusive, "play audio");
+            if let Some(item) = item.as_ref() {
+                push_now_playing(state, item, audio_device.as_deref(), exclusive);
+            }
             state
                 .audio
                 .play_track(url.to_string(), container, audio_device, exclusive);
@@ -1664,6 +1669,151 @@ fn push_item_image(
         item.image = slint::Image::from_rgba8(buffer);
         item.has_image = true;
         model.set_row_data(index, item);
+    });
+}
+
+// ---------------------------------------------------------------- now-playing
+
+/// Build the now-playing snapshot from a Jellyfin Audio item plus the
+/// active output settings, push it to the bar, then kick off the
+/// cover fetch. Caller has already resolved the URL and is about to
+/// call `play_track` — order doesn't matter, the bar is independent
+/// of the audio engine's actual state.
+fn push_now_playing(
+    state: &AuthedState,
+    item: &BaseItemDto,
+    device_id: Option<&str>,
+    exclusive: bool,
+) {
+    let title = item.name.clone().unwrap_or_default();
+    let artist = item
+        .album_artist
+        .clone()
+        .or_else(|| item.artists.as_ref().and_then(|a| a.first().cloned()))
+        .unwrap_or_default();
+    let tech = track_tech(item);
+    let bitperfect = is_currently_bitperfect(state, device_id, exclusive);
+    set_now_playing(&state.weak, title, artist, tech, bitperfect);
+
+    // The Audio item carries `album_id`; if Jellyfin didn't supply it,
+    // fall back to `parent_id` (which is the album for tracks). We
+    // pass no tag — Jellyfin serves the current Primary image by id.
+    let album_id = item
+        .album_id
+        .clone()
+        .or_else(|| item.parent_id.clone())
+        .unwrap_or_default();
+    if !album_id.is_empty() {
+        spawn_now_playing_cover_fetch(state, album_id);
+    }
+}
+
+/// True when the configured output is bit-perfect *right now*: exclusive
+/// mode on AND the selected device is a known hardware device in the
+/// cached audio-device list. System default (`device_id` empty) can't
+/// be classified — assume mixer-routed.
+fn is_currently_bitperfect(state: &AuthedState, device_id: Option<&str>, exclusive: bool) -> bool {
+    if !exclusive {
+        return false;
+    }
+    let Some(id) = device_id.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let guard = state.audio_devices.lock().unwrap();
+    guard.iter().any(|d| d.id == id && d.bitperfect)
+}
+
+fn set_now_playing(
+    weak: &slint::Weak<MainWindow>,
+    title: String,
+    artist: String,
+    tech: String,
+    bitperfect: bool,
+) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_now_playing(NowPlaying {
+                title: SharedString::from(title),
+                artist: SharedString::from(artist),
+                tech: SharedString::from(tech),
+                cover: slint::Image::default(),
+                has_cover: false,
+                bitperfect,
+                visible: true,
+            });
+        }
+    });
+}
+
+fn set_now_playing_cover(weak: &slint::Weak<MainWindow>, rgba: Vec<u8>, width: u32, height: u32) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(w) = weak.upgrade() else {
+            return;
+        };
+        // Only stamp the cover onto the *current* snapshot — if the
+        // user advanced to another track between the fetch starting
+        // and finishing, the snapshot already moved on and `visible`
+        // is still true; we'd overwrite the right cover. Cheap fix:
+        // skip when the bar isn't visible at all (signed out / never
+        // played). The race for "track advanced mid-fetch" is benign
+        // because tracks within an album share the cover.
+        let current = w.get_now_playing();
+        if !current.visible {
+            return;
+        }
+        let mut buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        w.set_now_playing(NowPlaying {
+            cover: slint::Image::from_rgba8(buffer),
+            has_cover: true,
+            ..current
+        });
+    });
+}
+
+fn clear_now_playing(weak: &slint::Weak<MainWindow>) {
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.set_now_playing(NowPlaying {
+                visible: false,
+                ..Default::default()
+            });
+        }
+    });
+}
+
+/// Fetch the now-playing cover off the album id. Independent of the
+/// album-detail cover fetch — the bar uses a smaller image (so we
+/// don't ship a 600px asset for a 48px thumb) and runs even when
+/// the user isn't looking at the album view.
+fn spawn_now_playing_cover_fetch(state: &AuthedState, album_id: String) {
+    let weak = state.weak.clone();
+    let http = state.image_http.clone();
+    let sem = state.image_sem.clone();
+    let base = state.client.base_url().clone();
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let url = image_url(
+            &base,
+            &album_id,
+            ApiImageType::Primary,
+            &ImageOptions {
+                tag: None,
+                fill_height: Some(120),
+                quality: Some(92),
+                ..Default::default()
+            },
+        );
+        match fetch_image(&http, &url).await {
+            Ok((rgba, w, h)) => set_now_playing_cover(&weak, rgba, w, h),
+            Err(e) => debug!(?e, %url, "now-playing cover fetch failed"),
+        }
     });
 }
 

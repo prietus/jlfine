@@ -37,6 +37,20 @@ export struct CastMember {
     has-image: bool,
 }
 
+// Snapshot of whatever's currently playing through the audio engine.
+// Pushed from Rust on every Play and cleared on sign-out. The bar at
+// the bottom of the window renders this verbatim — no lookups happen
+// in Slint.
+export struct NowPlaying {
+    title: string,
+    artist: string,
+    tech: string,
+    cover: image,
+    has-cover: bool,
+    bitperfect: bool,
+    visible: bool,
+}
+
 export enum Screen { login, library, settings }
 
 // --- design tokens -------------------------------------------------
@@ -502,6 +516,127 @@ component TrackRow inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// Persistent strip across the bottom of the window while audio is
+// playing. No transport controls today — the audio engine has no
+// pause/seek/position API yet (#audio-controls). Cover lazy-loads;
+// chips/badge collapse to nothing when their content is empty.
+component NowPlayingBar inherits Rectangle {
+    in property <NowPlaying> data;
+    height: 72px;
+    background: Theme.bg-panel;
+
+    // 1px top stroke to separate it from the content above.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 1px;
+        background: Theme.stroke-faint;
+    }
+
+    HorizontalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 14px;
+
+        // Cover.
+        Rectangle {
+            width: 48px;
+            height: 48px;
+            border-radius: 6px;
+            clip: true;
+            background: #1a1d24;
+            if !root.data.has-cover: Rectangle {
+                background: @linear-gradient(135deg, #262b38 0%, #1a1d24 100%);
+                Text {
+                    text: "♪";
+                    color: #4a5060;
+                    font-size: 24px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.data.has-cover: Image {
+                source: root.data.cover;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+        }
+
+        // Title + artist.
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.data.title;
+                color: Theme.text-primary;
+                font-size: 13px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.data.artist;
+                visible: root.data.artist != "";
+                color: Theme.text-muted;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+
+        // Tech chip (DSD64 / FLAC 24/96 / …).
+        Rectangle {
+            width: tech-text.preferred-width + 18px;
+            height: 22px;
+            y: (parent.height - self.height) / 2;
+            visible: root.data.tech != "";
+            background: #ffffff10;
+            border-radius: 11px;
+            tech-text := Text {
+                text: root.data.tech;
+                color: Theme.text-primary;
+                font-size: 11px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                x: 9px;
+                y: 0;
+                width: parent.width - 18px;
+                height: parent.height;
+            }
+        }
+
+        // Bitperfect badge — green ring, only when the active output is
+        // both a hardware device AND exclusive mode is on.
+        Rectangle {
+            width: bp-text.preferred-width + 18px;
+            height: 22px;
+            y: (parent.height - self.height) / 2;
+            visible: root.data.bitperfect;
+            background: #4caf5022;
+            border-radius: 11px;
+            border-width: 1px;
+            border-color: #4caf5099;
+            bp-text := Text {
+                text: "BITPERFECT";
+                color: #8fdc92;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.6px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                x: 9px;
+                y: 0;
+                width: parent.width - 18px;
+                height: parent.height;
+            }
+        }
     }
 }
 
@@ -1667,6 +1802,13 @@ export component MainWindow inherits Window {
     in property <string> selected-audio-device-label: "System default";
     in-out property <bool> exclusive-mode: true;
     in property <bool> devices-loading: false;
+    in property <NowPlaying> now-playing: { visible: false };
+
+    // Reserved bottom strip for the now-playing bar. Both library and
+    // settings shrink by this amount so nothing (sidebar buttons,
+    // Done) gets hidden underneath. Login intentionally ignores it —
+    // there's nothing playing pre-auth.
+    property <length> bar-h: root.now-playing.visible ? 72px : 0px;
 
     callback sign-in-clicked(string, string, string);
     callback sign-out-clicked();
@@ -1704,7 +1846,7 @@ export component MainWindow inherits Window {
         x: 0;
         y: 0;
         width: parent.width;
-        height: parent.height;
+        height: parent.height - root.bar-h;
         opacity: root.screen == Screen.library ? 1.0 : 0.0;
         visible: self.opacity > 0.001;
         animate opacity { duration: 220ms; easing: ease-out; }
@@ -1765,7 +1907,7 @@ export component MainWindow inherits Window {
         x: 0;
         y: 0;
         width: parent.width;
-        height: parent.height;
+        height: parent.height - root.bar-h;
         opacity: root.screen == Screen.settings ? 1.0 : 0.0;
         visible: self.opacity > 0.001;
         animate opacity { duration: 220ms; easing: ease-out; }
@@ -1779,5 +1921,13 @@ export component MainWindow inherits Window {
         select-audio-device(id) => { root.select-audio-device(id); }
         set-exclusive-mode(v) => { root.set-exclusive-mode(v); }
         refresh-devices => { root.refresh-devices(); }
+    }
+
+    NowPlayingBar {
+        x: 0;
+        y: parent.height - self.height;
+        width: parent.width;
+        visible: root.now-playing.visible && root.screen != Screen.login;
+        data: root.now-playing;
     }
 }
